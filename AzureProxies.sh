@@ -44,12 +44,15 @@ STORAGE_KEY=$(az storage account keys list --resource-group "$RESOURCE_GROUP" --
 # Créer le conteneur Blob s'il n'existe pas
 az storage container create --name "$CONTAINER_NAME" --account-name "$STORAGE_ACCOUNT" --account-key "$STORAGE_KEY"
 
-# Télécharger le script de configuration sur le Blob
-SCRIPT_URL="https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/configure-proxy.sh"
+# Générer une URL SAS pour le script
+SAS_TOKEN=$(az storage blob generate-sas --account-name "$STORAGE_ACCOUNT" --container-name "$CONTAINER_NAME" --name "configure-proxy.sh" --permissions r --expiry $(date -u -d "1 day" '+%Y-%m-%dT%H:%MZ') --output tsv)
+
+SCRIPT_URL="https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/configure-proxy.sh?$SAS_TOKEN"
+
 cat <<EOF > configure-proxy.sh
 #!/bin/bash
 # Configuration du serveur proxy
-sudo apt update && sudo apt install -y squid apache2-utils
+sudo apt update && sudo apt upgrade -y && sudo apt install -y squid apache2-utils
 sudo htpasswd -bc /etc/squid/squid_passwd $PROXY_USERNAME $PROXY_PASSWORD
 
 # Configurer Squid avec authentification
@@ -102,9 +105,9 @@ package_update: true
 package_upgrade: true
 
 runcmd:
-  - wget $SCRIPT_URL -O /tmp/configure-proxy.sh
-  - chmod +x /tmp/configure-proxy.sh
-  - /tmp/configure-proxy.sh $PROXY_PORT $PROXY_USERNAME $PROXY_PASSWORD
+  - wget "$SCRIPT_URL" -O /tmp/configure-proxy.sh >> /var/log/proxy-setup.log 2>&1
+  - chmod +x /tmp/configure-proxy.sh >> /var/log/proxy-setup.log 2>&1
+  - /tmp/configure-proxy.sh $PROXY_PORT $PROXY_USERNAME $PROXY_PASSWORD >> /var/log/proxy-setup.log 2>&1
 EOF
 
     # Créer la VM avec cloud-init
