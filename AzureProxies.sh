@@ -1,17 +1,20 @@
 #!/bin/bash
 
 # Variables de configuration
-RESOURCE_GROUP="RG-Proxies"  # Nom du groupe de ressources
-LOCATION="eastus"          # Région Azure
-VM_SIZE="Standard_B1s"     # Type de machine virtuelle
+RESOURCE_GROUP="<RG-Name-Here>"  # Nom du groupe de ressources
+LOCATION="eastus"        # Région Azure
+VM_SIZE="Standard_B1s"   # Type de machine virtuelle
 IMAGE="Canonical:UbuntuServer:18.04-LTS:latest"  # Image Ubuntu
-STORAGE_ACCOUNT="proxyconfigstorage"  # Compte de stockage pour les scripts
+STORAGE_ACCOUNT="<STORAGE-Name-Here>"  # Compte de stockage pour les scripts
 CONTAINER_NAME="scripts"   # Nom du conteneur Blob
 PROXY_PORT_BASE=30000      # Port de départ pour les proxies
 
 # Vérifier l'existence du groupe de ressources, sinon le créer
 if ! az group exists --name "$RESOURCE_GROUP"; then
+    echo "Le groupe de ressources $RESOURCE_GROUP n'existe pas, création en cours..."
     az group create --name "$RESOURCE_GROUP" --location "$LOCATION"
+else
+    echo "Le groupe de ressources $RESOURCE_GROUP existe déjà."
 fi
 
 # Demander le nombre de machines à créer
@@ -25,10 +28,14 @@ echo
 # Demander le nom de domaine pour l'entrypoint
 read -p "Nom de domaine pour l'entrypoint (laisser vide pour utiliser l'IP publique) : " ENTRYPOINT
 
-# Créer le compte de stockage s'il n'existe pas
-if ! az storage account check-name --name "$STORAGE_ACCOUNT" --query "nameAvailable" --output tsv; then
-    echo "Création du compte de stockage $STORAGE_ACCOUNT..."
+# Vérifier si le compte de stockage existe dans le groupe de ressources
+EXISTING_STORAGE_ACCOUNT=$(az storage account show --name "$STORAGE_ACCOUNT" --resource-group "$RESOURCE_GROUP" --query "name" --output tsv 2>/dev/null)
+
+if [[ -z "$EXISTING_STORAGE_ACCOUNT" ]]; then
+    echo "Le compte de stockage $STORAGE_ACCOUNT n'existe pas dans le groupe de ressources $RESOURCE_GROUP, création en cours..."
     az storage account create --name "$STORAGE_ACCOUNT" --resource-group "$RESOURCE_GROUP" --location "$LOCATION" --sku Standard_LRS
+else
+    echo "Le compte de stockage $STORAGE_ACCOUNT existe déjà dans le groupe de ressources $RESOURCE_GROUP."
 fi
 
 # Récupérer la clé du compte de stockage
@@ -58,7 +65,7 @@ http_access allow authenticated
 http_access deny all
 
 # Spécifier l'écoute sur le port spécifié
-http_port $PROXY_PORT
+http_port \$1
 
 # Logs
 access_log /var/log/squid/access.log
@@ -68,8 +75,8 @@ EOL
 sudo systemctl restart squid
 EOF
 
-# Charger le script dans le Blob
-az storage blob upload --account-name "$STORAGE_ACCOUNT" --account-key "$STORAGE_KEY" --container-name "$CONTAINER_NAME" --name "configure-proxy.sh" --file "configure-proxy.sh"
+# Charger le script dans le Blob Storage
+az storage blob upload --account-name "$STORAGE_ACCOUNT" --account-key "$STORAGE_KEY" --container-name "$CONTAINER_NAME" --name "configure-proxy.sh" --file "configure-proxy.sh" --auth-mode login
 
 # Générer les VM
 for ((i=0; i<MACHINE_COUNT; i++)); do
