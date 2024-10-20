@@ -1,13 +1,14 @@
 #!/bin/bash
 
 # Variables de configuration
-RESOURCE_GROUP="<RG-Name-Here>"  # Nom du groupe de ressources
-LOCATION="eastus"        # Région Azure
-VM_SIZE="Standard_B1s"   # Type de machine virtuelle
-IMAGE="Canonical:UbuntuServer:18.04-LTS:latest"  # Image Ubuntu
-STORAGE_ACCOUNT="<STORAGE-Name-Here>"  # Compte de stockage pour les scripts
-CONTAINER_NAME="scripts"   # Nom du conteneur Blob
-PROXY_PORT_BASE=30000      # Port de départ pour les proxies
+RESOURCE_GROUP="<RG-Proxies>"
+LOCATION="eastus"
+VM_SIZE="Standard_B1s"
+IMAGE="Canonical:UbuntuServer:18.04-LTS:latest"
+STORAGE_ACCOUNT="<storageproxiesname>" # Must be lowercase
+CONTAINER_NAME="scripts"
+PROXY_PORT_BASE=30000
+FRONTEND_VM="haproxy-vm"  # VM frontale pour HAProxy
 
 # Vérifier l'existence du groupe de ressources, sinon le créer
 if ! az group exists --name "$RESOURCE_GROUP"; then
@@ -28,25 +29,38 @@ echo
 # Demander le nom de domaine pour l'entrypoint
 read -p "Nom de domaine pour l'entrypoint (laisser vide pour utiliser l'IP publique) : " ENTRYPOINT
 
+# Demander la clé publique SSH à l'utilisateur
+read -p "Veuillez fournir la clé publique SSH : " SSH_PUBLIC_KEY
+
 # Vérifier si le compte de stockage existe dans le groupe de ressources
 EXISTING_STORAGE_ACCOUNT=$(az storage account show --name "$STORAGE_ACCOUNT" --resource-group "$RESOURCE_GROUP" --query "name" --output tsv 2>/dev/null)
 
+# Créer le compte de stockage si non existant
 if [[ -z "$EXISTING_STORAGE_ACCOUNT" ]]; then
     echo "Le compte de stockage $STORAGE_ACCOUNT n'existe pas dans le groupe de ressources $RESOURCE_GROUP, création en cours..."
-    az storage account create --name "$STORAGE_ACCOUNT" --resource-group "$RESOURCE_GROUP" --location "$LOCATION" --sku Standard_LRS
+    az storage account create --name "$STORAGE_ACCOUNT" --resource-group "$RESOURCE_GROUP" --location "$LOCATION" --sku Standard_LRS --only-show-errors
 else
     echo "Le compte de stockage $STORAGE_ACCOUNT existe déjà dans le groupe de ressources $RESOURCE_GROUP."
 fi
 
-# Récupérer la clé du compte de stockage
+# Obtenir la clé du compte de stockage
 STORAGE_KEY=$(az storage account keys list --resource-group "$RESOURCE_GROUP" --account-name "$STORAGE_ACCOUNT" --query "[0].value" --output tsv)
 
 # Créer le conteneur Blob s'il n'existe pas
-az storage container create --name "$CONTAINER_NAME" --account-name "$STORAGE_ACCOUNT" --account-key "$STORAGE_KEY"
+az storage container create --name "$CONTAINER_NAME" --account-name "$STORAGE_ACCOUNT" --account-key "$STORAGE_KEY" --only-show-errors
 
-# Générer une URL SAS pour le script
-SAS_TOKEN=$(az storage blob generate-sas --account-name "$STORAGE_ACCOUNT" --container-name "$CONTAINER_NAME" --name "configure-proxy.sh" --permissions r --expiry $(date -u -d "1 day" '+%Y-%m-%dT%H:%MZ') --output tsv)
+# Générer un SAS Token valide pour le fichier de configuration du proxy
+SAS_TOKEN=$(az storage blob generate-sas \
+    --account-name "$STORAGE_ACCOUNT" \
+    --container-name "$CONTAINER_NAME" \
+    --name "configure-proxy.sh" \
+    --permissions r \
+    --expiry "$(date -u -d '1 day' '+%Y-%m-%dT%H:%MZ')" \
+    --output tsv)
 
+echo "Token SAS : "$SAS_TOKEN
+
+# URL du script avec SAS Token
 SCRIPT_URL="https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/configure-proxy.sh?$SAS_TOKEN"
 
 cat <<EOF > configure-proxy.sh
@@ -81,15 +95,28 @@ EOF
 # Charger le script dans le Blob Storage
 az storage blob upload --account-name "$STORAGE_ACCOUNT" --account-key "$STORAGE_KEY" --container-name "$CONTAINER_NAME" --name "configure-proxy.sh" --file "configure-proxy.sh" --auth-mode login
 
-# Générer les VM
+# Vérifier si HAProxy existe
+EXISTING_HAPROXY=$(az vm show --name "$FRONTEND_VM" --resource-group "$RESOURCE_GROUP" --query "name" --output tsv 2>/dev/null)
+
+# Liste des backends existants pour HAProxy
+HAPROXY_BACKENDS=""
+HAPROXY_FRONTENDS=""
+
+# Ajouter les machines existantes à HAProxy
+EXISTING_VMS=$(az vm list --resource-group "$RESOURCE_GROUP" --query "[].name" --output tsv)
+for VM in $EXISTING_VMS; do
+    IP=$(az vm show --resource-group "$RESOURCE_GROUP" --name "$VM" --show-details --query publicIps --output tsv)
+    PORT=$(echo "$VM" | grep -o -E '[0-9]+$')
+    HAPROXY_BACKENDS+="  server $VM $IP:3128 check\n"
+    HAPROXY_FRONTENDS+="  use_backend $VM if { hdr_beg(host) -i $ENTRYPOINT:$PORT }\n"
+done
+
+# Générer la configuration de HAProxy avec les nouvelles machines
 for ((i=0; i<MACHINE_COUNT; i++)); do
-    # Incrémenter le proxy port
     PROXY_PORT=$((PROXY_PORT_BASE + i))
-
-    # Nom unique de la machine
     VM_NAME="proxy-vm-$PROXY_PORT"
-
-    # Générer le fichier cloud-init pour chaque VM
+    
+    # Générer le cloud-init pour chaque VM proxy
     cat <<EOF > cloud-init-$VM_NAME.yaml
 #cloud-config
 hostname: $VM_NAME
@@ -99,15 +126,18 @@ users:
     groups: sudo
     shell: /bin/bash
     ssh_authorized_keys:
-      - $(cat ~/.ssh/id_rsa.pub)
+      - $SSH_PUBLIC_KEY
 
 package_update: true
 package_upgrade: true
 
 runcmd:
-  - wget "$SCRIPT_URL" -O /tmp/configure-proxy.sh >> /var/log/proxy-setup.log 2>&1
-  - chmod +x /tmp/configure-proxy.sh >> /var/log/proxy-setup.log 2>&1
-  - /tmp/configure-proxy.sh $PROXY_PORT $PROXY_USERNAME $PROXY_PASSWORD >> /var/log/proxy-setup.log 2>&1
+  - echo "Downloading configuration script for $VM_NAME..."
+  -  curl -o /tmp/configure-proxy.sh "$SCRIPT_URL"
+  - echo "Script successfully downloaded, starting proxy configuration for $VM_NAME..."
+  - chmod +x /tmp/configure-proxy.sh
+  - /tmp/configure-proxy.sh $PROXY_PORT $PROXY_USERNAME $PROXY_PASSWORD
+  - echo "Proxy successfully configured for $VM_NAME."
 EOF
 
     # Créer la VM avec cloud-init
@@ -116,16 +146,77 @@ EOF
         --name "$VM_NAME" \
         --image "$IMAGE" \
         --size "$VM_SIZE" \
+        --custom-data cloud-init-$VM_NAME.yaml \
         --admin-username "$PROXY_USERNAME" \
         --admin-password "$PROXY_PASSWORD" \
-        --custom-data cloud-init-$VM_NAME.yaml \
-        --no-wait
+        --only-show-errors
+
+    # Ajouter la nouvelle machine à HAProxy
+    IP=$(az vm show --resource-group "$RESOURCE_GROUP" --name "$VM_NAME" --show-details --query publicIps --output tsv)
+    HAPROXY_BACKENDS+="  server $VM_NAME $IP:3128 check\n"
+    HAPROXY_FRONTENDS+="  use_backend $VM_NAME if { hdr_beg(host) -i $ENTRYPOINT:$PROXY_PORT }\n"
 done
 
-# Final message
-echo "Création des machines terminée. Vous pouvez accéder à vos proxies via l'entrypoint $ENTRYPOINT avec les ports suivants :"
+# Créer ou mettre à jour la machine HAProxy
+if [[ -z "$EXISTING_HAPROXY" ]]; then
+    echo "Création de la machine HAProxy..."
+    az vm create \
+        --resource-group "$RESOURCE_GROUP" \
+        --name "$FRONTEND_VM" \
+        --image "$IMAGE" \
+        --size "$VM_SIZE" \
+        --admin-username "$PROXY_USERNAME" \
+        --admin-password "$PROXY_PASSWORD" \
+        --custom-data cloud-init-haproxy.yaml \
+        --only-show-errors
+else
+    echo "Mise à jour de la configuration de HAProxy..."
+fi
+
+# Générer la configuration HAProxy
+cat <<EOF > cloud-init-haproxy.yaml
+#cloud-config
+packages:
+  - haproxy  # Installer HAProxy
+
+package_update: true
+package_upgrade: true
+
+runcmd:
+  - echo "Updating system..."
+  - sudo apt-get update && sudo apt-get upgrade -y
+
+  - echo "HAProxy configuration..."
+  - sudo tee /etc/haproxy/haproxy.cfg <<EOL
+defaults
+  mode tcp
+  timeout connect 5000ms
+  timeout client  50000ms
+  timeout server  50000ms
+
+frontend http-in
+  bind *:80
+$HAPROXY_FRONTENDS
+
+backend proxy-backends
+$HAPROXY_BACKENDS
+EOL
+
+  - echo "Restarting HAProxy to apply modifications..."
+  - sudo systemctl restart haproxy
+
+  - echo "HAProxy successfully started."
+EOF
+
+# Final message avec IP publique des machines créées
+echo "Création des machines terminée. Voici les IPs publiques des machines créées :"
 
 for ((i=0; i<MACHINE_COUNT; i++)); do
-    PROXY_PORT=$((PROXY_PORT_BASE + i))
-    echo "$ENTRYPOINT:$PROXY_PORT"
+    VM_NAME="proxy-vm-$((PROXY_PORT_BASE + i))"
+    PUBLIC_IP=$(az vm show --resource-group "$RESOURCE_GROUP" --name "$VM_NAME" --show-details --query [publicIps] --output tsv)
+    echo "$VM_NAME : $PUBLIC_IP"
 done
+
+# IP publique du HAProxy
+HA_PROXY_IP=$(az vm show --resource-group "$RESOURCE_GROUP" --name "$FRONTEND_VM" --show-details --query [publicIps] --output tsv)
+echo "HAProxy : $HA_PROXY_IP"
