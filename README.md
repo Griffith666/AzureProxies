@@ -77,3 +77,5 @@ curl -x http://<proxy-ip>:<proxy-port> -U <proxy-username>:<proxy-password> http
 
 The script automatically configures HAProxy with the backends (proxy VMs). If you need to manually update the configuration, you can edit `/etc/haproxy/haproxy.cfg` on the HAProxy VM.
 
+### License
+This project is licensed under the MIT License - see the LICENSE file for details.
