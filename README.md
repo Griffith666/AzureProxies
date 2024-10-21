@@ -55,3 +55,25 @@ Before you begin, ensure you have the following:
     - `STORAGE_ACCOUNT`
     - `CONTAINER_NAME`
     - `PROXY_PORT_BASE`
+   ### Step 2: Connect to a Proxy VM
+
+Once the script completes, it will output the public IP addresses of the created proxy VMs. You can SSH into any proxy VM using:
+
+```bash
+ssh <proxy-username>@<public-ip>
+```
+
+Each proxy VM will listen on a unique port defined by the script.
+
+### Step 3: Test the Proxies
+
+You can test the proxy by connecting to it with tools such as `curl`:
+
+```bash
+curl -x http://<proxy-ip>:<proxy-port> -U <proxy-username>:<proxy-password> https://www.google.com
+```
+
+### Step 4: Update HAProxy Configuration
+
+The script automatically configures HAProxy with the backends (proxy VMs). If you need to manually update the configuration, you can edit `/etc/haproxy/haproxy.cfg` on the HAProxy VM.
+
