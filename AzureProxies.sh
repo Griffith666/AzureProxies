@@ -62,7 +62,7 @@ echo "SAS Token généré pour le script de configuration du proxy : $SAS_TOKEN"
 
 # URL du script avec SAS Token
 SCRIPT_URL="https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/configure-proxy.sh?$SAS_TOKEN"
-SCRIPT_URL_HAPROXY="https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/configure-haproxy.sh?$SAS_TOKEN"
+
 
 
 cat <<EOF > configure-proxy.sh
@@ -266,6 +266,30 @@ EOF
     HAPROXY_FRONTENDS+="  use_backend $VM_NAME if { hdr_beg(host) -i $ENTRYPOINT:$PROXY_PORT }\n"
 done
 
+# Générer un SAS Token valide pour le fichier de configuration du haproxy
+SAS_TOKEN_HAPROXY=$(az storage container generate-sas \
+    --account-name "$STORAGE_ACCOUNT" \
+    --name "$CONTAINER_NAME" \
+    --permissions lr \
+    --expiry "$(date -u -d '1 day' '+%Y-%m-%dT%H:%MZ')" \
+    --output tsv)
+
+# Créer l'URL complète du script avec le SAS Token
+SCRIPT_URL_HAPROXY="https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/configure-haproxy.sh?$SAS_TOKEN_HAPROXY"
+
+# Message de debug pour afficher l'URL générée
+echo "Script de configuration HAProxy : $SCRIPT_URL_HAPROXY"
+
+# Générer le cloud-init pour HAProxy
+cat <<EOF > cloud-init-haproxy.yaml
+#cloud-config
+runcmd:
+  - sudo echo "Downloading and proceeding to HAProxy configuration..."
+  - sudo curl -o /tmp/configure-haproxy.sh "$SCRIPT_URL_HAPROXY"
+  - sudo chmod +x /tmp/configure-haproxy.sh
+  - sudo /tmp/configure-haproxy.sh
+EOF
+
 # Créer ou mettre à jour la machine HAProxy
 if [[ -z "$EXISTING_HAPROXY" ]]; then
     echo "Création de la machine HAProxy..."
@@ -282,15 +306,7 @@ else
     echo "Mise à jour de la configuration de HAProxy..."
 fi
 
-# Générer le cloud-init pour HAProxy
-cat <<EOF > cloud-init-haproxy.yaml
-#cloud-config
-runcmd:
-  - echo "Downloading and proceeding to HAProxy configuration..."
-  - curl -o /tmp/configure-haproxy.sh "$SCRIPT_URL_HAPROXY"
-  - chmod +x /tmp/configure-haproxy.sh
-  - /tmp/configure-haproxy.sh
-EOF
+
 
 # Mettre à jour le NSG avec les nouveaux ports
 update_nsg_haproxy
