@@ -72,6 +72,11 @@ You can test the proxy by connecting to it with tools such as `curl`:
 ```bash
 curl -x http://<proxy-ip>:<proxy-port> -U <proxy-username>:<proxy-password> https://www.google.com
 ```
+Or if you are using a domain as an entrypoint
+
+```bash
+curl -x http://<entrypoint>:<proxy-port> -U <proxy-username>:<proxy-password> https://www.google.com
+```
 
 ### Step 4: Update HAProxy Configuration
 
