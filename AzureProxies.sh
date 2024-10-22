@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Variables de configuration
-RESOURCE_GROUP="RG-Proxies"
+RESOURCE_GROUP="RG-Proxy"
 LOCATION="eastus"
 VM_SIZE="Standard_B1s"
 IMAGE="Canonical:UbuntuServer:18.04-LTS:latest"
@@ -70,19 +70,7 @@ cat <<EOF > configure-proxy.sh
 # Configuration du serveur proxy
 sudo apt update && sudo apt upgrade -y && sudo apt install -y squid apache2-utils
 
-# Vérifier si le port est bien passé en paramètre
-if [[ -z "$1" ]]; then
-    echo "Erreur : Aucun port spécifié. Usage : ./configure-proxy.sh <PORT> <USERNAME> <PASSWORD>"
-    exit 1
-fi
-
-PROXY_PORT=$1
-PROXY_USERNAME=$2
-PROXY_PASSWORD=$3
-
-# Debugging : Afficher les valeurs pour vérifier si elles sont correctes
-echo "Utilisation du port : $PROXY_PORT"
-echo "Nom d'utilisateur : $PROXY_USERNAME"
+echo "Creating VM: $VM_NAME with port: $PROXY_PORT, username: $PROXY_USERNAME"
 
 sudo htpasswd -bc /etc/squid/squid_passwd $PROXY_USERNAME $PROXY_PASSWORD
 
@@ -225,6 +213,7 @@ for ((i=0; i<MACHINE_COUNT; i++)); do
     PROXY_PORT=$((PROXY_PORT_BASE + i))
     VM_NAME="proxy-vm-$PROXY_PORT"
 
+
     # Générer le cloud-init pour chaque VM proxy
     cat <<EOF > cloud-init-$VM_NAME.yaml
 #cloud-config
@@ -244,8 +233,9 @@ runcmd:
   - echo "Downloading script for $VM_NAME..."
   - curl -o /tmp/configure-proxy.sh "$SCRIPT_URL"
   - echo "Starting proxy configuration for $VM_NAME..."
+  - echo "VM_NAME: $VM_NAME, PROXY_PORT: $PROXY_PORT, PROXY_USERNAME: $PROXY_USERNAME, PROXY_PASSWORD: $PROXY_PASSWORD"
   - chmod +x /tmp/configure-proxy.sh
-  - /tmp/configure-proxy.sh $PROXY_PORT $PROXY_USERNAME $PROXY_PASSWORD
+  - /tmp/configure-proxy.sh "$PROXY_PORT" "$PROXY_USERNAME" "$PROXY_PASSWORD"
   - echo "Proxy successfully configured for $VM_NAME."
 EOF
 
