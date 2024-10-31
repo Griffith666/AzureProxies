@@ -1,11 +1,11 @@
 #!/bin/bash
 
 # Variables de configuration
-RESOURCE_GROUP="RG-Proxies"
+RESOURCE_GROUP="RG-Leo"
 LOCATION="eastus"
 VM_SIZE="Standard_B1s"
 IMAGE="Canonical:UbuntuServer:18.04-LTS:latest"
-STORAGE_ACCOUNT="storageproxies"
+STORAGE_ACCOUNT="storageproxiesleo"
 CONTAINER_NAME="scripts"
 PROXY_PORT_BASE=30000
 FRONTEND_VM="haproxy-vm"  # VM frontale pour HAProxy
@@ -139,10 +139,10 @@ frontend http-in
   bind *:80
   default_backend proxy-backends
 
-$HAPROXY_FRONTENDS
+"$HAPROXY_FRONTENDS"
 
 backend proxy-backends
-$HAPROXY_BACKENDS
+"$HAPROXY_BACKENDS"
 EOL
 
 # Redémarrer HAProxy
@@ -277,8 +277,8 @@ EOF
 
     # Ajouter la nouvelle machine à HAProxy
     IP=$(az vm show --resource-group "$RESOURCE_GROUP" --name "$VM_NAME" --show-details --query publicIps --output tsv)
-    HAPROXY_BACKENDS+="  server $VM_NAME $IP:3128 check\n"
-    HAPROXY_FRONTENDS+="  use_backend $VM_NAME if { hdr_beg(host) -i $ENTRYPOINT:$PROXY_PORT }\n"
+    HAPROXY_BACKENDS+="  server $VM_NAME $IP:3128 check"
+    HAPROXY_FRONTENDS+="  use_backend $VM_NAME if { hdr_beg(host) -i $ENTRYPOINT:$PROXY_PORT }"
 done
 
 # Générer un SAS Token valide pour le fichier de configuration du haproxy
@@ -297,8 +297,8 @@ echo "Script de configuration HAProxy : $SCRIPT_URL_HAPROXY"
 
 # Création d'un fichier de variables pour HAProxy
 cat <<EOF > haproxy-vars.sh
-HAPROXY_FRONTENDS="$HAPROXY_FRONTENDS"
-HAPROXY_BACKENDS="$HAPROXY_BACKENDS"
+HAPROXY_FRONTENDS='$(echo -e "$HAPROXY_FRONTENDS")'
+HAPROXY_BACKENDS='$(echo -e "$HAPROXY_BACKENDS")'
 EOF
 
 # Charger le fichier de variables HAProxy dans le stockage Azure
@@ -313,9 +313,7 @@ runcmd:
   - curl -o /tmp/configure-haproxy.sh "$SCRIPT_URL_HAPROXY"
   - curl -o /tmp/haproxy-vars.sh "https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/haproxy-vars.sh?$SAS_TOKEN_HAPROXY"
   - chmod +x /tmp/configure-haproxy.sh /tmp/haproxy-vars.sh
-  - |
-    source /tmp/haproxy-vars.sh
-    /tmp/configure-haproxy.sh
+  - /tmp/configure-haproxy.sh
 
 EOF
 
