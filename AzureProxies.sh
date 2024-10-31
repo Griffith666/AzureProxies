@@ -1,11 +1,11 @@
 #!/bin/bash
 
 # Variables de configuration
-RESOURCE_GROUP="RG-Leo"
+RESOURCE_GROUP="RG-Proxy"
 LOCATION="eastus"
 VM_SIZE="Standard_B1s"
 IMAGE="Canonical:UbuntuServer:18.04-LTS:latest"
-STORAGE_ACCOUNT="storageproxiesleo"
+STORAGE_ACCOUNT="storageproxies"
 CONTAINER_NAME="scripts"
 PROXY_PORT_BASE=30000
 FRONTEND_VM="haproxy-vm"  # VM frontale pour HAProxy
@@ -112,20 +112,22 @@ EOF
 
 cat <<EOF > configure-haproxy.sh
 #!/bin/bash
-# Charger les variables de configuration depuis haproxy-vars.sh
+
+# Charger les chemins des fichiers de variables depuis haproxy-vars.sh
 source /tmp/haproxy-vars.sh
 
+# Vérification des fichiers de variables
+if [[ -f "$HAPROXY_FRONTENDS_FILE" && -f "$HAPROXY_BACKENDS_FILE" ]]; then
+    HAPROXY_FRONTENDS=$(cat "$HAPROXY_FRONTENDS_FILE")
+    HAPROXY_BACKENDS=$(cat "$HAPROXY_BACKENDS_FILE")
+else
+    echo "Error: Variable files not found!"
+    exit 1
+fi
 
 # Debugging: Afficher les variables pour vérification
 echo "HAPROXY_FRONTENDS: $HAPROXY_FRONTENDS"
 echo "HAPROXY_BACKENDS: $HAPROXY_BACKENDS"
-
-# Vérifier si HAProxy est déjà configuré
-if [ -f /etc/haproxy/haproxy.cfg ]; then
-  echo "HAProxy configuration found. Updating configuration..."
-else
-  echo "No HAProxy configuration found. Creating new configuration..."
-fi
 
 # Créer ou mettre à jour la configuration HAProxy
 sudo tee /etc/haproxy/haproxy.cfg <<EOL
@@ -139,10 +141,10 @@ frontend http-in
   bind *:80
   default_backend proxy-backends
 
-"$HAPROXY_FRONTENDS"
+$HAPROXY_FRONTENDS
 
 backend proxy-backends
-"$HAPROXY_BACKENDS"
+$HAPROXY_BACKENDS
 EOL
 
 # Redémarrer HAProxy
@@ -295,11 +297,17 @@ SCRIPT_URL_HAPROXY="https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NA
 # Message de debug pour afficher l'URL générée
 echo "Script de configuration HAProxy : $SCRIPT_URL_HAPROXY"
 
-# Création d'un fichier de variables pour HAProxy
+# Création d'un fichier de variables pour HAProxy avec fichiers temporaires
 cat <<EOF > haproxy-vars.sh
-HAPROXY_FRONTENDS='$(echo -e "$HAPROXY_FRONTENDS")'
-HAPROXY_BACKENDS='$(echo -e "$HAPROXY_BACKENDS")'
+# Export des chemins des fichiers contenant les valeurs des variables
+export HAPROXY_FRONTENDS_FILE="/tmp/haproxy_frontends.txt"
+export HAPROXY_BACKENDS_FILE="/tmp/haproxy_backends.txt"
+
+# Enregistrement des valeurs exactes des variables dans les fichiers respectifs
+echo "$HAPROXY_FRONTENDS" > \$HAPROXY_FRONTENDS_FILE
+echo "$HAPROXY_BACKENDS" > \$HAPROXY_BACKENDS_FILE
 EOF
+
 
 # Charger le fichier de variables HAProxy dans le stockage Azure
 az storage blob upload --account-name "$STORAGE_ACCOUNT" --account-key "$STORAGE_KEY" --container-name "$CONTAINER_NAME" --name "haproxy-vars.sh" --file "haproxy-vars.sh" --auth-mode login
@@ -314,7 +322,6 @@ runcmd:
   - curl -o /tmp/haproxy-vars.sh "https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/haproxy-vars.sh?$SAS_TOKEN_HAPROXY"
   - chmod +x /tmp/configure-haproxy.sh /tmp/haproxy-vars.sh
   - /tmp/configure-haproxy.sh
-
 EOF
 
 # Créer ou mettre à jour la machine HAProxy
