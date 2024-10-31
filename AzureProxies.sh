@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Variables de configuration
-RESOURCE_GROUP="RG-Proxy"
+RESOURCE_GROUP="RG-Proxies"
 LOCATION="eastus"
 VM_SIZE="Standard_B1s"
 IMAGE="Canonical:UbuntuServer:18.04-LTS:latest"
@@ -67,12 +67,19 @@ SCRIPT_URL="https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/confi
 
 cat <<EOF > configure-proxy.sh
 #!/bin/bash
+# Charger les variables de configuration depuis proxy-vars.sh
+source /tmp/proxy-vars.sh
+
+echo "VM_NAME: $VM_NAME"
+echo "PROXY_PORT: $PROXY_PORT"
+echo "PROXY_USERNAME: $PROXY_USERNAME"
+
 # Configuration du serveur proxy
 sudo apt update && sudo apt upgrade -y && sudo apt install -y squid apache2-utils
 
 echo "Creating VM: $VM_NAME with port: $PROXY_PORT, username: $PROXY_USERNAME"
 
-sudo htpasswd -bc /etc/squid/squid_passwd $PROXY_USERNAME $PROXY_PASSWORD
+sudo htpasswd -bc /etc/squid/squid_passwd "$PROXY_USERNAME" "$PROXY_PASSWORD"
 
 # Configurer Squid avec authentification et spécifier le port
 sudo tee /etc/squid/squid.conf <<EOL
@@ -86,8 +93,7 @@ acl authenticated proxy_auth REQUIRED
 http_access allow authenticated
 http_access deny all
 
-# Spécifier l'écoute sur le port
-http_port $PROXY_PORT
+http_port 3128
 
 # Logs
 access_log /var/log/squid/access.log
@@ -106,13 +112,22 @@ EOF
 
 cat <<EOF > configure-haproxy.sh
 #!/bin/bash
-# Installer HAProxy et configurer le load balancing
+# Charger les variables de configuration depuis haproxy-vars.sh
+source /tmp/haproxy-vars.sh
 
-# Mettre à jour le système et installer HAProxy
-sudo apt-get update && sudo apt-get upgrade -y
-sudo apt-get install -y haproxy
 
-# Créer la configuration HAProxy
+# Debugging: Afficher les variables pour vérification
+echo "HAPROXY_FRONTENDS: $HAPROXY_FRONTENDS"
+echo "HAPROXY_BACKENDS: $HAPROXY_BACKENDS"
+
+# Vérifier si HAProxy est déjà configuré
+if [ -f /etc/haproxy/haproxy.cfg ]; then
+  echo "HAProxy configuration found. Updating configuration..."
+else
+  echo "No HAProxy configuration found. Creating new configuration..."
+fi
+
+# Créer ou mettre à jour la configuration HAProxy
 sudo tee /etc/haproxy/haproxy.cfg <<EOL
 defaults
   mode tcp
@@ -214,6 +229,16 @@ for ((i=0; i<MACHINE_COUNT; i++)); do
     VM_NAME="proxy-vm-$PROXY_PORT"
 
 
+    cat <<EOF > proxy-vars-$VM_NAME.sh
+VM_NAME="$VM_NAME"
+PROXY_PORT="$PROXY_PORT"
+PROXY_USERNAME="$PROXY_USERNAME"
+PROXY_PASSWORD="$PROXY_PASSWORD"
+EOF
+
+  # Charger le fichier de variables dans le stockage Azure
+    az storage blob upload --account-name "$STORAGE_ACCOUNT" --account-key "$STORAGE_KEY" --container-name "$CONTAINER_NAME" --name "proxy-vars-$VM_NAME.sh" --file "proxy-vars-$VM_NAME.sh" --auth-mode login
+
     # Générer le cloud-init pour chaque VM proxy
     cat <<EOF > cloud-init-$VM_NAME.yaml
 #cloud-config
@@ -232,11 +257,11 @@ package_upgrade: true
 runcmd:
   - echo "Downloading script for $VM_NAME..."
   - curl -o /tmp/configure-proxy.sh "$SCRIPT_URL"
-  - echo "Starting proxy configuration for $VM_NAME..."
-  - echo "VM_NAME: $VM_NAME, PROXY_PORT: $PROXY_PORT, PROXY_USERNAME: $PROXY_USERNAME, PROXY_PASSWORD: $PROXY_PASSWORD"
-  - chmod +x /tmp/configure-proxy.sh
-  - /tmp/configure-proxy.sh "$PROXY_PORT" "$PROXY_USERNAME" "$PROXY_PASSWORD"
-  - echo "Proxy successfully configured for $VM_NAME."
+  - curl -o /tmp/proxy-vars.sh "https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/proxy-vars-$VM_NAME.sh?$SAS_TOKEN"
+  - chmod +x /tmp/configure-proxy.sh /tmp/proxy-vars.sh
+  - |
+    source /tmp/proxy-vars.sh
+    /tmp/configure-proxy.sh
 EOF
 
     # Créer la VM avec cloud-init
@@ -270,14 +295,28 @@ SCRIPT_URL_HAPROXY="https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NA
 # Message de debug pour afficher l'URL générée
 echo "Script de configuration HAProxy : $SCRIPT_URL_HAPROXY"
 
+# Création d'un fichier de variables pour HAProxy
+cat <<EOF > haproxy-vars.sh
+HAPROXY_FRONTENDS="$HAPROXY_FRONTENDS"
+HAPROXY_BACKENDS="$HAPROXY_BACKENDS"
+EOF
+
+# Charger le fichier de variables HAProxy dans le stockage Azure
+az storage blob upload --account-name "$STORAGE_ACCOUNT" --account-key "$STORAGE_KEY" --container-name "$CONTAINER_NAME" --name "haproxy-vars.sh" --file "haproxy-vars.sh" --auth-mode login
+
+
 # Générer le cloud-init pour HAProxy
 cat <<EOF > cloud-init-haproxy.yaml
 #cloud-config
 runcmd:
-  - sudo echo "Downloading and proceeding to HAProxy configuration..."
-  - sudo curl -o /tmp/configure-haproxy.sh "$SCRIPT_URL_HAPROXY"
-  - sudo chmod +x /tmp/configure-haproxy.sh
-  - sudo /tmp/configure-haproxy.sh
+  - echo "Downloading HAProxy configuration script..."
+  - curl -o /tmp/configure-haproxy.sh "$SCRIPT_URL_HAPROXY"
+  - curl -o /tmp/haproxy-vars.sh "https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/haproxy-vars.sh?$SAS_TOKEN_HAPROXY"
+  - chmod +x /tmp/configure-haproxy.sh /tmp/haproxy-vars.sh
+  - |
+    source /tmp/haproxy-vars.sh
+    /tmp/configure-haproxy.sh
+
 EOF
 
 # Créer ou mettre à jour la machine HAProxy
