@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Variables de configuration
-RESOURCE_GROUP="RG-Proxy"
+RESOURCE_GROUP="RG-Proxies"
 LOCATION="eastus"
 VM_SIZE="Standard_B1s"
 IMAGE="Canonical:UbuntuServer:18.04-LTS:latest"
@@ -110,55 +110,8 @@ sudo systemctl restart squid
 echo "Squid configuré avec succès sur le port $PROXY_PORT."
 EOF
 
-cat <<EOF > configure-haproxy.sh
-#!/bin/bash
-
-# Charger les chemins des fichiers de variables depuis haproxy-vars.sh
-source /tmp/haproxy-vars.sh
-
-# Vérification des fichiers de variables
-if [[ -f "$HAPROXY_FRONTENDS_FILE" && -f "$HAPROXY_BACKENDS_FILE" ]]; then
-    HAPROXY_FRONTENDS=$(cat "$HAPROXY_FRONTENDS_FILE")
-    HAPROXY_BACKENDS=$(cat "$HAPROXY_BACKENDS_FILE")
-else
-    echo "Error: Variable files not found!"
-    exit 1
-fi
-
-# Debugging: Afficher les variables pour vérification
-echo "HAPROXY_FRONTENDS: $HAPROXY_FRONTENDS"
-echo "HAPROXY_BACKENDS: $HAPROXY_BACKENDS"
-
-# Créer ou mettre à jour la configuration HAProxy
-sudo tee /etc/haproxy/haproxy.cfg <<EOL
-defaults
-  mode tcp
-  timeout connect 5000ms
-  timeout client  50000ms
-  timeout server  50000ms
-
-frontend http-in
-  bind *:80
-  default_backend proxy-backends
-
-$HAPROXY_FRONTENDS
-
-backend proxy-backends
-$HAPROXY_BACKENDS
-EOL
-
-# Redémarrer HAProxy
-sudo systemctl restart haproxy
-
-# Activer HAProxy au démarrage
-sudo systemctl enable haproxy
-
-echo "HAProxy configuration terminée et démarrée avec succès."
-EOF
-
 # Charger le script dans le Blob Storage
 az storage blob upload --account-name "$STORAGE_ACCOUNT" --account-key "$STORAGE_KEY" --container-name "$CONTAINER_NAME" --name "configure-proxy.sh" --file "configure-proxy.sh" --auth-mode login
-az storage blob upload --account-name "$STORAGE_ACCOUNT" --account-key "$STORAGE_KEY" --container-name "$CONTAINER_NAME" --name "configure-haproxy.sh" --file "configure-haproxy.sh" --auth-mode login
 
 # Fonction pour créer le NSG et associer les règles de sécurité
 create_nsg_haproxy() {
@@ -221,8 +174,10 @@ EXISTING_VMS=$(az vm list --resource-group "$RESOURCE_GROUP" --query "[].name" -
 for VM in $EXISTING_VMS; do
     IP=$(az vm show --resource-group "$RESOURCE_GROUP" --name "$VM" --show-details --query publicIps --output tsv)
     PORT=$(echo "$VM" | grep -o -E '[0-9]+$')
-    HAPROXY_BACKENDS+="  server $VM $IP:3128 check\n"
-    HAPROXY_FRONTENDS+="  use_backend $VM if { hdr_beg(host) -i $ENTRYPOINT:$PORT }\n"
+    if [[ $VM == proxy-vm-* ]]; then
+        HAPROXY_BACKENDS+="$VM $IP:3128"
+        HAPROXY_FRONTENDS+="$VM $PORT"
+    fi
 done
 
 # Générer la configuration de HAProxy avec les nouvelles machines
@@ -279,8 +234,8 @@ EOF
 
     # Ajouter la nouvelle machine à HAProxy
     IP=$(az vm show --resource-group "$RESOURCE_GROUP" --name "$VM_NAME" --show-details --query publicIps --output tsv)
-    HAPROXY_BACKENDS+="  server $VM_NAME $IP:3128 check"
-    HAPROXY_FRONTENDS+="  use_backend $VM_NAME if { hdr_beg(host) -i $ENTRYPOINT:$PROXY_PORT }"
+    HAPROXY_BACKENDS+="$VM_NAME $IP:3128"
+    HAPROXY_FRONTENDS+="$VM_NAME $PROXY_PORT"
 done
 
 # Générer un SAS Token valide pour le fichier de configuration du haproxy
@@ -298,31 +253,141 @@ SCRIPT_URL_HAPROXY="https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NA
 echo "Script de configuration HAProxy : $SCRIPT_URL_HAPROXY"
 
 # Création d'un fichier de variables pour HAProxy avec fichiers temporaires
-cat <<EOF > haproxy-vars.sh
-# Export des chemins des fichiers contenant les valeurs des variables
+cat <<'EOF' > haproxy-vars.sh
 export HAPROXY_FRONTENDS_FILE="/tmp/haproxy_frontends.txt"
 export HAPROXY_BACKENDS_FILE="/tmp/haproxy_backends.txt"
 
-# Enregistrement des valeurs exactes des variables dans les fichiers respectifs
-echo "$HAPROXY_FRONTENDS" > \$HAPROXY_FRONTENDS_FILE
-echo "$HAPROXY_BACKENDS" > \$HAPROXY_BACKENDS_FILE
+# Créer les fichiers avec le contenu
+cat > "${HAPROXY_FRONTENDS_FILE}" <<FRONTENDS
+${HAPROXY_FRONTENDS}
+FRONTENDS
+
+cat > "${HAPROXY_BACKENDS_FILE}" <<BACKENDS
+${HAPROXY_BACKENDS}
+BACKENDS
 EOF
 
 
 # Charger le fichier de variables HAProxy dans le stockage Azure
 az storage blob upload --account-name "$STORAGE_ACCOUNT" --account-key "$STORAGE_KEY" --container-name "$CONTAINER_NAME" --name "haproxy-vars.sh" --file "haproxy-vars.sh" --auth-mode login
 
-
 # Générer le cloud-init pour HAProxy
 cat <<EOF > cloud-init-haproxy.yaml
 #cloud-config
+write_files:
+  - path: /tmp/haproxy_frontends.txt
+    content: |
+      ${HAPROXY_FRONTENDS}
+    permissions: '0644'
+  - path: /tmp/haproxy_backends.txt
+    content: |
+      ${HAPROXY_BACKENDS}
+    permissions: '0644'
+  - path: /tmp/haproxy-vars.sh
+    content: |
+      export HAPROXY_FRONTENDS_FILE="/tmp/haproxy_frontends.txt"
+      export HAPROXY_BACKENDS_FILE="/tmp/haproxy_backends.txt"
+    permissions: '0644'
+
+package_update: true
+package_upgrade: true
+packages:
+  - haproxy
+  - curl
+
 runcmd:
-  - echo "Downloading HAProxy configuration script..."
-  - curl -o /tmp/configure-haproxy.sh "$SCRIPT_URL_HAPROXY"
-  - curl -o /tmp/haproxy-vars.sh "https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/haproxy-vars.sh?$SAS_TOKEN_HAPROXY"
-  - chmod +x /tmp/configure-haproxy.sh /tmp/haproxy-vars.sh
+  - chmod +x /tmp/haproxy-vars.sh
+  - source /tmp/haproxy-vars.sh
+  - curl -o /tmp/configure-haproxy.sh "${SCRIPT_URL_HAPROXY}"
+  - chmod +x /tmp/configure-haproxy.sh
   - /tmp/configure-haproxy.sh
+  - systemctl enable haproxy
+  - systemctl restart haproxy
 EOF
+
+cat <<EOF > configure-haproxy.sh
+#!/bin/bash
+
+# Fonction de logging
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+}
+
+log "Démarrage de la configuration HAProxy"
+
+# Vérifier les fichiers
+if [ ! -f "/tmp/haproxy_frontends.txt" ] || [ ! -f "/tmp/haproxy_backends.txt" ]; then
+    log "Erreur: Fichiers de configuration manquants"
+    exit 1
+fi
+
+# Lire le contenu des fichiers
+HAPROXY_FRONTENDS=$(cat "/tmp/haproxy_frontends.txt" | sed 's/\\n//g')
+HAPROXY_BACKENDS=$(cat "/tmp/haproxy_backends.txt" | sed 's/\\n//g')
+
+# Extraire les paires port/backend uniques
+BACKEND_PORTS=$(echo "$HAPROXY_FRONTENDS" | grep -o 'proxy.privato.app:[0-9]*' | cut -d':' -f2 | sort -u)
+
+# Créer la configuration HAProxy
+log "Création de la configuration HAProxy..."
+sudo tee /etc/haproxy/haproxy.cfg <<EOL
+global
+    log /dev/log local0
+    log /dev/log local1 notice
+    chroot /var/lib/haproxy
+    stats socket /run/haproxy/admin.sock mode 660 level admin expose-fd listeners
+    stats timeout 30s
+    user haproxy
+    group haproxy
+    daemon
+
+defaults
+    mode tcp
+    timeout connect 5000ms
+    timeout client  50000ms
+    timeout server  50000ms
+
+# Frontend pour chaque port
+$(for port in $BACKEND_PORTS; do
+    vm_name=$(echo "$HAPROXY_FRONTENDS" | grep ":$port" | grep -o 'proxy-vm-[0-9]*')
+    server_line=$(echo "$HAPROXY_BACKENDS" | grep "server $vm_name")
+    if [ ! -z "$vm_name" ] && [ ! -z "$server_line" ]; then
+        echo "frontend ft_$port"
+        echo "    bind *:$port"
+        echo "    mode tcp"
+        echo "    default_backend bk_$port"
+        echo ""
+        echo "backend bk_$port"
+        echo "    mode tcp"
+        echo "    server $server_line"
+        echo ""
+    fi
+done)
+
+# Statistics page
+frontend stats
+    bind *:8404
+    mode http
+    stats enable
+    stats uri /stats
+    stats refresh 10s
+    stats admin if LOCALHOST
+EOL
+
+# Vérifier la configuration
+log "Vérification de la configuration HAProxy..."
+if sudo haproxy -c -f /etc/haproxy/haproxy.cfg; then
+    log "Configuration valide"
+    sudo systemctl restart haproxy
+    log "HAProxy redémarré avec succès"
+else
+    log "Erreur dans la configuration HAProxy"
+    exit 1
+fi
+EOF
+
+az storage blob upload --account-name "$STORAGE_ACCOUNT" --account-key "$STORAGE_KEY" --container-name "$CONTAINER_NAME" --name "configure-haproxy.sh" --file "configure-haproxy.sh" --auth-mode login
+
 
 # Créer ou mettre à jour la machine HAProxy
 if [[ -z "$EXISTING_HAPROXY" ]]; then
@@ -357,3 +422,11 @@ done
 # IP publique du HAProxy
 HA_PROXY_IP=$(az vm show --resource-group "$RESOURCE_GROUP" --name "$FRONTEND_VM" --show-details --query [publicIps] --output tsv)
 echo "HAProxy : $HA_PROXY_IP"
+
+# Haproxy status
+echo "Vérification de l'état de HAProxy..."
+az vm run-command invoke \
+  --resource-group "$RESOURCE_GROUP" \
+  --name "$FRONTEND_VM" \
+  --command-id RunShellScript \
+  --scripts "systemctl status haproxy"
