@@ -111,8 +111,9 @@ auth_param basic realm Squid proxy-caching web server
 auth_param basic credentialsttl 2 hours
 auth_param basic casesensitive off
 
-# ACLs
+# ACLs de base
 acl SSL_ports port 443
+acl CONNECT method CONNECT
 acl Safe_ports port 80          # http
 acl Safe_ports port 21          # ftp
 acl Safe_ports port 443         # https
@@ -127,8 +128,9 @@ http_access deny CONNECT !SSL_ports
 http_access allow authenticated
 http_access deny all
 
-# Configuration du port
-http_port 3128
+# Configuration du port et des options
+http_port 0.0.0.0:3128
+visible_hostname $(hostname -f)
 
 # Configuration des logs
 access_log /var/log/squid/access.log
@@ -137,6 +139,10 @@ cache_log /var/log/squid/cache.log
 # Configuration du cache
 cache_dir ufs /var/spool/squid 100 16 256
 coredump_dir /var/spool/squid
+
+# Options supplémentaires pour améliorer les performances
+maximum_object_size 128 MB
+cache_mem 256 MB
 EOL
 
 # Initialiser le cache
@@ -151,10 +157,20 @@ sudo systemctl restart squid
 # Vérifier le statut
 if sudo systemctl is-active --quiet squid; then
     log "Squid configuré et démarré avec succès sur le port 3128"
+    # Afficher les ports en écoute pour vérification
+    sudo netstat -tulpn | grep squid
 else
     log "Erreur lors du démarrage de Squid"
     sudo systemctl status squid
     exit 1
+fi
+
+# Vérifier les logs
+log "Vérification des logs Squid..."
+if [ -f "/var/log/squid/cache.log" ]; then
+    sudo tail -n 5 /var/log/squid/cache.log
+else
+    log "Fichier de log non trouvé"
 fi
 EOF
 
@@ -244,6 +260,17 @@ update_nsg_haproxy() {
             --protocol Tcp \
             --access Allow \
             --direction Inbound
+        
+        # Ajouter règle pour SSH
+        az network nsg rule create \
+            --resource-group "$RESOURCE_GROUP" \
+            --nsg-name "$NSG_NAME" \
+            --name "Allow-SSH" \
+            --priority 1002 \
+            --destination-port-ranges 22 \
+            --protocol Tcp \
+            --access Allow \
+            --direction Inbound
         done
 }
 
@@ -260,8 +287,8 @@ for VM in $EXISTING_VMS; do
     IP=$(az vm show --resource-group "$RESOURCE_GROUP" --name "$VM" --show-details --query publicIps --output tsv)
     PORT=$(echo "$VM" | grep -o -E '[0-9]+$')
     if [[ $VM == proxy-vm-* ]]; then
-        HAPROXY_BACKENDS+="$VM $IP:3128"
-        HAPROXY_FRONTENDS+="$VM $PORT"
+        echo "$VM $IP:3128" >> "/tmp/haproxy_backends.txt"
+        echo "$IP $PORT" >> "/tmp/haproxy_frontends.txt"
     fi
 done
 
@@ -410,12 +437,9 @@ if [ ! -f "/tmp/haproxy_frontends.txt" ] || [ ! -f "/tmp/haproxy_backends.txt" ]
     exit 1
 fi
 
-# Lire le contenu des fichiers
-HAPROXY_FRONTENDS=$(cat "/tmp/haproxy_frontends.txt" | sed 's/\\n//g')
-HAPROXY_BACKENDS=$(cat "/tmp/haproxy_backends.txt" | sed 's/\\n//g')
-
-# Extraire les paires port/backend uniques
-BACKEND_PORTS=$(echo "$HAPROXY_FRONTENDS" | grep -o 'proxy.privato.app:[0-9]*' | cut -d':' -f2 | sort -u)
+# Lire le contenu des fichiers et traiter les données
+HAPROXY_FRONTENDS=$(cat "/tmp/haproxy_frontends.txt")
+HAPROXY_BACKENDS=$(cat "/tmp/haproxy_backends.txt")
 
 # Créer la configuration HAProxy
 log "Création de la configuration HAProxy..."
@@ -432,26 +456,29 @@ global
 
 defaults
     mode tcp
-    timeout connect 5000ms
-    timeout client  50000ms
-    timeout server  50000ms
+    log global
+    option tcplog
+    timeout connect 10s
+    timeout client 30s
+    timeout server 30s
 
-# Frontend pour chaque port
-$(for port in $BACKEND_PORTS; do
-    vm_name=$(echo "$HAPROXY_FRONTENDS" | grep ":$port" | grep -o 'proxy-vm-[0-9]*')
-    server_line=$(echo "$HAPROXY_BACKENDS" | grep "server $vm_name")
-    if [ ! -z "$vm_name" ] && [ ! -z "$server_line" ]; then
-        echo "frontend ft_$port"
-        echo "    bind *:$port"
-        echo "    mode tcp"
-        echo "    default_backend bk_$port"
-        echo ""
-        echo "backend bk_$port"
-        echo "    mode tcp"
-        echo "    server $server_line"
-        echo ""
-    fi
-done)
+$(while read -r line; do
+    VM_NAME=$(echo "$line" | cut -d' ' -f1)
+    PORT=$(echo "$line" | cut -d' ' -f2)
+    IP=$(grep "^$VM_NAME" /tmp/haproxy_backends.txt | cut -d' ' -f2)
+    
+    cat <<EOF
+    # Configuration pour $VM_NAME
+    frontend ft_$PORT
+        bind *:$PORT
+        mode tcp
+        default_backend bk_$PORT
+
+    backend bk_$PORT
+        mode tcp
+        server $VM_NAME $IP check
+EOF
+done < /tmp/haproxy_frontends.txt)
 
 # Statistics page
 frontend stats
@@ -460,7 +487,6 @@ frontend stats
     stats enable
     stats uri /stats
     stats refresh 10s
-    stats admin if LOCALHOST
 EOL
 
 # Vérifier la configuration
@@ -512,10 +538,19 @@ done
 HA_PROXY_IP=$(az vm show --resource-group "$RESOURCE_GROUP" --name "$FRONTEND_VM" --show-details --query [publicIps] --output tsv)
 echo "HAProxy : $HA_PROXY_IP"
 
-# Haproxy status
-echo "Vérification de l'état de HAProxy..."
-az vm run-command invoke \
-  --resource-group "$RESOURCE_GROUP" \
-  --name "$FRONTEND_VM" \
-  --command-id RunShellScript \
-  --scripts "systemctl status haproxy"
+# Script de test à exécuter après le déploiement
+check_connectivity() {
+    local VM_NAME=$1
+    local PORT=$2
+    
+    echo "Test de connexion pour $VM_NAME sur le port $PORT..."
+    
+    # Test direct sur le proxy
+    IP=$(az vm show --resource-group "$RESOURCE_GROUP" --name "$VM_NAME" --show-details --query publicIps --output tsv)
+    echo "Test direct sur $IP:3128..."
+    curl -v -m 10 -x "$IP:3128" -U "$PROXY_USERNAME:$PROXY_PASSWORD" http://example.com
+    
+    # Test via HAProxy
+    echo "Test via HAProxy sur le port $PORT..."
+    curl -v -m 10 -x "$HAPROXY_IP:$PORT" -U "$PROXY_USERNAME:$PROXY_PASSWORD" http://example.com
+}
