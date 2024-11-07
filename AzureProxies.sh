@@ -67,47 +67,95 @@ SCRIPT_URL="https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/confi
 
 cat <<EOF > configure-proxy.sh
 #!/bin/bash
-# Charger les variables de configuration depuis proxy-vars.sh
+# Fonction de logging
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+}
+
+# Charger les variables de configuration
 source /tmp/proxy-vars.sh
 
-echo "VM_NAME: $VM_NAME"
-echo "PROXY_PORT: $PROXY_PORT"
-echo "PROXY_USERNAME: $PROXY_USERNAME"
+log "Configuration de Squid pour VM: $VM_NAME"
+log "Port: $PROXY_PORT, Username: $PROXY_USERNAME"
 
-# Configuration du serveur proxy
-sudo apt update && sudo apt upgrade -y && sudo apt install -y squid apache2-utils
+# Installation des paquets nécessaires
+sudo apt update
+sudo apt install -y squid apache2-utils
 
-echo "Creating VM: $VM_NAME with port: $PROXY_PORT, username: $PROXY_USERNAME"
+# Nettoyer les fichiers existants de Squid
+log "Nettoyage des fichiers Squid existants..."
+sudo systemctl stop squid
+sudo rm -rf /var/run/squid.pid
+sudo rm -rf /var/spool/squid/*
+sudo rm -rf /var/log/squid/*
 
+# Créer les répertoires nécessaires avec les bonnes permissions
+sudo mkdir -p /var/log/squid
+sudo mkdir -p /var/spool/squid
+sudo chown -R proxy:proxy /var/log/squid
+sudo chown -R proxy:proxy /var/spool/squid
+sudo chmod -R 755 /var/log/squid
+sudo chmod -R 755 /var/spool/squid
+
+# Configurer l'authentification
+log "Configuration de l'authentification..."
 sudo htpasswd -bc /etc/squid/squid_passwd "$PROXY_USERNAME" "$PROXY_PASSWORD"
 
-# Configurer Squid avec authentification et spécifier le port
+# Créer la configuration Squid
+log "Création de la configuration Squid..."
 sudo tee /etc/squid/squid.conf <<EOL
+# Paramètres d'authentification
 auth_param basic program /usr/lib/squid/basic_ncsa_auth /etc/squid/squid_passwd
 auth_param basic children 5
 auth_param basic realm Squid proxy-caching web server
 auth_param basic credentialsttl 2 hours
 auth_param basic casesensitive off
 
+# ACLs
+acl SSL_ports port 443
+acl Safe_ports port 80          # http
+acl Safe_ports port 21          # ftp
+acl Safe_ports port 443         # https
+acl Safe_ports port 70          # gopher
+acl Safe_ports port 210         # wais
+acl Safe_ports port 1025-65535  # unregistered ports
 acl authenticated proxy_auth REQUIRED
+
+# Règles d'accès
+http_access deny !Safe_ports
+http_access deny CONNECT !SSL_ports
 http_access allow authenticated
 http_access deny all
 
+# Configuration du port
 http_port 3128
 
-# Logs
+# Configuration des logs
 access_log /var/log/squid/access.log
 cache_log /var/log/squid/cache.log
+
+# Configuration du cache
+cache_dir ufs /var/spool/squid 100 16 256
+coredump_dir /var/spool/squid
 EOL
 
-# Corriger les permissions sur les dossiers de logs
-sudo chown -R proxy:proxy /var/log/squid
-sudo chmod -R 755 /var/log/squid
+# Initialiser le cache
+log "Initialisation du cache Squid..."
+sudo squid -z
 
-# Redémarrer Squid
+# Démarrer Squid
+log "Démarrage de Squid..."
+sudo systemctl enable squid
 sudo systemctl restart squid
 
-echo "Squid configuré avec succès sur le port $PROXY_PORT."
+# Vérifier le statut
+if sudo systemctl is-active --quiet squid; then
+    log "Squid configuré et démarré avec succès sur le port 3128"
+else
+    log "Erreur lors du démarrage de Squid"
+    sudo systemctl status squid
+    exit 1
+fi
 EOF
 
 # Charger le script dans le Blob Storage
@@ -123,24 +171,61 @@ create_nsg_haproxy() {
     else
         echo "Le NSG $NSG_NAME existe déjà."
     fi
-
-    # Ouvrir temporairement le port 22 pour le débogage SSH
-    echo "Ajout de la règle pour ouvrir temporairement le port 22 (SSH) dans le NSG $NSG_NAME"
-    az network nsg rule create \
-        --resource-group "$RESOURCE_GROUP" \
-        --nsg-name "$NSG_NAME" \
-        --name "Allow-SSH-Temporary" \
-        --priority 100 \
-        --destination-port-ranges 22 \
-        --protocol Tcp \
-        --access Allow \
-        --direction Inbound
-
     # Attacher le NSG à l'interface réseau de la VM HAProxy
     NIC_ID=$(az vm show --resource-group "$RESOURCE_GROUP" --name "$FRONTEND_VM" --query "networkProfile.networkInterfaces[0].id" --output tsv)
     if [[ -n "$NIC_ID" ]]; then
         echo "Association du NSG $NSG_NAME à la NIC $NIC_ID de HAProxy..."
         az network nic update --ids "$NIC_ID" --network-security-group "$NSG_NAME"
+    fi
+}
+
+create_proxy_nsg() {
+    local VM_NAME=$1
+    local NSG_NAME="${VM_NAME}-nsg"
+    
+    echo "Configuration du NSG pour $VM_NAME..."
+    
+    # Créer le NSG pour la machine proxy
+    az network nsg create \
+        --resource-group "$RESOURCE_GROUP" \
+        --name "$NSG_NAME" \
+        --location "$LOCATION"
+    
+    # Ajouter règle pour SSH
+    az network nsg rule create \
+        --resource-group "$RESOURCE_GROUP" \
+        --nsg-name "$NSG_NAME" \
+        --name "Allow-SSH" \
+        --priority 1000 \
+        --destination-port-ranges 22 \
+        --protocol Tcp \
+        --access Allow \
+        --direction Inbound
+    
+    # Ajouter règle pour Squid
+    az network nsg rule create \
+        --resource-group "$RESOURCE_GROUP" \
+        --nsg-name "$NSG_NAME" \
+        --name "Allow-Squid" \
+        --priority 1001 \
+        --destination-port-ranges 3128 \
+        --protocol Tcp \
+        --access Allow \
+        --direction Inbound
+    
+    # Obtenir l'ID de la carte réseau de la VM
+    local NIC_ID=$(az vm show \
+        --resource-group "$RESOURCE_GROUP" \
+        --name "$VM_NAME" \
+        --query "networkProfile.networkInterfaces[0].id" \
+        --output tsv)
+    
+    # Associer le NSG à la carte réseau
+    if [[ -n "$NIC_ID" ]]; then
+        echo "Association du NSG $NSG_NAME à la carte réseau de $VM_NAME..."
+        az network nic update \
+            --ids "$NIC_ID" \
+            --network-security-group "$NSG_NAME"
     fi
 }
 
@@ -159,7 +244,7 @@ update_nsg_haproxy() {
             --protocol Tcp \
             --access Allow \
             --direction Inbound
-    done
+        done
 }
 
 # Vérifier si HAProxy existe et si le NSG est attaché
@@ -231,6 +316,10 @@ EOF
         --admin-username "$PROXY_USERNAME" \
         --admin-password "$PROXY_PASSWORD" \
         --only-show-errors
+
+
+    # Créer et configurer le NSG pour cette machine proxy
+    create_proxy_nsg "$VM_NAME"
 
     # Ajouter la nouvelle machine à HAProxy
     IP=$(az vm show --resource-group "$RESOURCE_GROUP" --name "$VM_NAME" --show-details --query publicIps --output tsv)
