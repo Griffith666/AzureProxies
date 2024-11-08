@@ -1,11 +1,11 @@
 #!/bin/bash
 
 # Variables de configuration
-RESOURCE_GROUP="RG-Leo"
+RESOURCE_GROUP="RG-Proxies"
 LOCATION="eastus"
 VM_SIZE="Standard_B1s"
 IMAGE="Canonical:UbuntuServer:18.04-LTS:latest"
-STORAGE_ACCOUNT="storageproxiesleo"
+STORAGE_ACCOUNT="storageproxies"
 CONTAINER_NAME="scripts"
 PROXY_PORT_BASE=30000
 FRONTEND_VM="haproxy-vm"  # VM frontale pour HAProxy
