@@ -1,11 +1,11 @@
 #!/bin/bash
 
 # Variables de configuration
-RESOURCE_GROUP="RG-Proxies"
+RESOURCE_GROUP="RG-Leo"
 LOCATION="eastus"
 VM_SIZE="Standard_B1s"
 IMAGE="Canonical:UbuntuServer:18.04-LTS:latest"
-STORAGE_ACCOUNT="storageproxies"
+STORAGE_ACCOUNT="storageproxiesleo"
 CONTAINER_NAME="scripts"
 PROXY_PORT_BASE=30000
 FRONTEND_VM="haproxy-vm"  # VM frontale pour HAProxy
@@ -281,14 +281,23 @@ EXISTING_HAPROXY=$(az vm show --name "$FRONTEND_VM" --resource-group "$RESOURCE_
 HAPROXY_BACKENDS=""
 HAPROXY_FRONTENDS=""
 
+format_proxy_data() {
+    local vm_name=$1
+    local ip=$2
+    local port=$3
+    
+    # Écrire dans les fichiers avec des retours à la ligne
+    echo "$vm_name $ip:3128" >> "/tmp/haproxy_backends.txt"
+    echo "$ip $port" >> "/tmp/haproxy_frontends.txt"
+}
+
 # Ajouter les machines existantes à HAProxy
 EXISTING_VMS=$(az vm list --resource-group "$RESOURCE_GROUP" --query "[].name" --output tsv)
 for VM in $EXISTING_VMS; do
-    IP=$(az vm show --resource-group "$RESOURCE_GROUP" --name "$VM" --show-details --query publicIps --output tsv)
-    PORT=$(echo "$VM" | grep -o -E '[0-9]+$')
     if [[ $VM == proxy-vm-* ]]; then
-        echo "$VM $IP:3128" >> "/tmp/haproxy_backends.txt"
-        echo "$IP $PORT" >> "/tmp/haproxy_frontends.txt"
+        IP=$(az vm show --resource-group "$RESOURCE_GROUP" --name "$VM" --show-details --query publicIps --output tsv)
+        PORT=$(echo "$VM" | grep -o -E '[0-9]+$')
+        format_proxy_data "$VM" "$IP" "$PORT"
     fi
 done
 
@@ -296,6 +305,8 @@ done
 for ((i=0; i<MACHINE_COUNT; i++)); do
     PROXY_PORT=$((PROXY_PORT_BASE + i))
     VM_NAME="proxy-vm-$PROXY_PORT"
+    IP=$(az vm show --resource-group "$RESOURCE_GROUP" --name "$VM_NAME" --show-details --query publicIps --output tsv)
+    format_proxy_data "$VM_NAME" "$IP" "$PROXY_PORT"
 
 
     cat <<EOF > proxy-vars-$VM_NAME.sh
@@ -351,7 +362,7 @@ EOF
     # Ajouter la nouvelle machine à HAProxy
     IP=$(az vm show --resource-group "$RESOURCE_GROUP" --name "$VM_NAME" --show-details --query publicIps --output tsv)
     HAPROXY_BACKENDS+="$VM_NAME $IP:3128"
-    HAPROXY_FRONTENDS+="$VM_NAME $PROXY_PORT"
+    HAPROXY_FRONTENDS+="$IP $PROXY_PORT"
 done
 
 # Générer un SAS Token valide pour le fichier de configuration du haproxy
@@ -404,14 +415,16 @@ write_files:
       export HAPROXY_FRONTENDS_FILE="/tmp/haproxy_frontends.txt"
       export HAPROXY_BACKENDS_FILE="/tmp/haproxy_backends.txt"
     permissions: '0644'
-
 package_update: true
 package_upgrade: true
 packages:
   - haproxy
   - curl
-
 runcmd:
+  - echo "Downloading HAProxy configuration script..."
+  - curl -o /tmp/configure-haproxy.sh "$SCRIPT_URL_HAPROXY"
+  - curl -o /tmp/haproxy-vars.sh "https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/haproxy-vars.sh?$SAS_TOKEN_HAPROXY"
+  - chmod +x /tmp/configure-haproxy.sh /tmp/haproxy-vars.sh
   - chmod +x /tmp/haproxy-vars.sh
   - source /tmp/haproxy-vars.sh
   - curl -o /tmp/configure-haproxy.sh "${SCRIPT_URL_HAPROXY}"
@@ -424,7 +437,7 @@ EOF
 cat <<EOF > configure-haproxy.sh
 #!/bin/bash
 
-# Fonction de logging
+# Fonction de logging avec message en paramètre
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
 }
@@ -437,11 +450,7 @@ if [ ! -f "/tmp/haproxy_frontends.txt" ] || [ ! -f "/tmp/haproxy_backends.txt" ]
     exit 1
 fi
 
-# Lire le contenu des fichiers et traiter les données
-HAPROXY_FRONTENDS=$(cat "/tmp/haproxy_frontends.txt")
-HAPROXY_BACKENDS=$(cat "/tmp/haproxy_backends.txt")
-
-# Créer la configuration HAProxy
+# Créer la configuration HAProxy de base
 log "Création de la configuration HAProxy..."
 sudo tee /etc/haproxy/haproxy.cfg <<EOL
 global
@@ -456,41 +465,67 @@ global
 
 defaults
     mode tcp
-    log global
-    option tcplog
-    timeout connect 10s
-    timeout client 30s
-    timeout server 30s
+    timeout connect 5000ms
+    timeout client  50000ms
+    timeout server  50000ms
 
-$(while read -r line; do
-    VM_NAME=$(echo "$line" | cut -d' ' -f1)
-    PORT=$(echo "$line" | cut -d' ' -f2)
-    IP=$(grep "^$VM_NAME" /tmp/haproxy_backends.txt | cut -d' ' -f2)
-    
-    cat <<EOF
-    # Configuration pour $VM_NAME
-    frontend ft_$PORT
-        bind *:$PORT
-        mode tcp
-        default_backend bk_$PORT
+EOL
 
-    backend bk_$PORT
-        mode tcp
-        server $VM_NAME $IP check
-EOF
-done < /tmp/haproxy_frontends.txt)
+# Debug: afficher le contenu des fichiers
+log "Contenu de haproxy_frontends.txt:"
+cat /tmp/haproxy_frontends.txt
+log "Contenu de haproxy_backends.txt:"
+cat /tmp/haproxy_backends.txt
 
-# Statistics page
+# Traiter chaque ligne du fichier frontends
+while IFS=' ' read -r ip port; do
+    log "Traitement du frontend pour IP: $ip, Port: $port"
+
+    # Configurer le frontend
+    sudo tee -a /etc/haproxy/haproxy.cfg <<EOL
+frontend ft_${port}
+    bind *:${port}
+    mode tcp
+    default_backend bk_${port}
+
+EOL
+
+    # Rechercher le backend correspondant
+    vm_name="proxy-vm-${port}"
+    backend_line=$(grep "^${vm_name}" /tmp/haproxy_backends.txt)
+
+    if [ -n "$backend_line" ]; then
+        # Extraire l'IP:port du backend
+        backend_ip_port=$(echo "$backend_line" | awk '{print $2}')
+        
+        # Configurer le backend
+        sudo tee -a /etc/haproxy/haproxy.cfg <<EOL
+backend bk_${port}
+    mode tcp
+    server ${vm_name} ${backend_ip_port} check
+
+EOL
+        log "Backend configuré pour ${vm_name} avec ${backend_ip_port}"
+    else
+        log "Attention: Aucun backend trouvé pour le port ${port}"
+    fi
+done < /tmp/haproxy_frontends.txt
+
+# Ajouter la configuration des stats
+sudo tee -a /etc/haproxy/haproxy.cfg <<EOL
 frontend stats
     bind *:8404
     mode http
     stats enable
     stats uri /stats
     stats refresh 10s
+    stats admin if LOCALHOST
 EOL
 
-# Vérifier la configuration
-log "Vérification de la configuration HAProxy..."
+# Vérifier et appliquer la configuration
+log "Configuration HAProxy finale:"
+cat /etc/haproxy/haproxy.cfg
+
 if sudo haproxy -c -f /etc/haproxy/haproxy.cfg; then
     log "Configuration valide"
     sudo systemctl restart haproxy
@@ -499,6 +534,12 @@ else
     log "Erreur dans la configuration HAProxy"
     exit 1
 fi
+
+# Afficher le statut final
+log "Statut de HAProxy après redémarrage:"
+sudo systemctl status haproxy
+log "Ports en écoute:"
+sudo netstat -tlnp | grep haproxy
 EOF
 
 az storage blob upload --account-name "$STORAGE_ACCOUNT" --account-key "$STORAGE_KEY" --container-name "$CONTAINER_NAME" --name "configure-haproxy.sh" --file "configure-haproxy.sh" --auth-mode login
@@ -537,20 +578,3 @@ done
 # IP publique du HAProxy
 HA_PROXY_IP=$(az vm show --resource-group "$RESOURCE_GROUP" --name "$FRONTEND_VM" --show-details --query [publicIps] --output tsv)
 echo "HAProxy : $HA_PROXY_IP"
-
-# Script de test à exécuter après le déploiement
-check_connectivity() {
-    local VM_NAME=$1
-    local PORT=$2
-    
-    echo "Test de connexion pour $VM_NAME sur le port $PORT..."
-    
-    # Test direct sur le proxy
-    IP=$(az vm show --resource-group "$RESOURCE_GROUP" --name "$VM_NAME" --show-details --query publicIps --output tsv)
-    echo "Test direct sur $IP:3128..."
-    curl -v -m 10 -x "$IP:3128" -U "$PROXY_USERNAME:$PROXY_PASSWORD" http://example.com
-    
-    # Test via HAProxy
-    echo "Test via HAProxy sur le port $PORT..."
-    curl -v -m 10 -x "$HAPROXY_IP:$PORT" -U "$PROXY_USERNAME:$PROXY_PASSWORD" http://example.com
-}
