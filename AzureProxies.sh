@@ -286,13 +286,25 @@ format_proxy_data() {
     local ip=$2
     local port=$3
     
-    # Écrire dans les fichiers avec des retours à la ligne
-    echo "$vm_name $ip:3128" >> "/tmp/haproxy_backends.txt"
-    echo "$ip $port" >> "/tmp/haproxy_frontends.txt"
+    # Vérifier si l'entrée existe déjà
+    local backend_exists=$(grep "^${vm_name}" /tmp/haproxy_backends.txt 2>/dev/null)
+    local frontend_exists=$(grep "^${ip} ${port}$" /tmp/haproxy_frontends.txt 2>/dev/null)
+    
+    if [ -z "$backend_exists" ]; then
+        echo "$vm_name $ip:3128" >> "/tmp/haproxy_backends.txt"
+    fi
+    
+    if [ -z "$frontend_exists" ]; then
+        echo "$ip $port" >> "/tmp/haproxy_frontends.txt"
+    fi
 }
 
+# Initialisation des fichiers
+> /tmp/haproxy_backends.txt
+> /tmp/haproxy_frontends.txt
+
 # Ajouter les machines existantes à HAProxy
-EXISTING_VMS=$(az vm list --resource-group "$RESOURCE_GROUP" --query "[].name" --output tsv)
+EXISTING_VMS=$(az vm list --resource-group "$RESOURCE_GROUP" --query "[?starts_with(name, 'proxy-vm-')].name" --output tsv)
 for VM in $EXISTING_VMS; do
     if [[ $VM == proxy-vm-* ]]; then
         IP=$(az vm show --resource-group "$RESOURCE_GROUP" --name "$VM" --show-details --query publicIps --output tsv)
@@ -305,9 +317,29 @@ done
 for ((i=0; i<MACHINE_COUNT; i++)); do
     PROXY_PORT=$((PROXY_PORT_BASE + i))
     VM_NAME="proxy-vm-$PROXY_PORT"
-    IP=$(az vm show --resource-group "$RESOURCE_GROUP" --name "$VM_NAME" --show-details --query publicIps --output tsv)
-    format_proxy_data "$VM_NAME" "$IP" "$PROXY_PORT"
-
+    
+    # Vérifier si la VM existe déjà
+    if ! az vm show --resource-group "$RESOURCE_GROUP" --name "$VM_NAME" &>/dev/null; then
+        # Créer nouvelle VM et configurer
+        echo "Création de la nouvelle VM $VM_NAME..."
+        az vm create \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$VM_NAME" \
+            --image "$IMAGE" \
+            --size "$VM_SIZE" \
+            --custom-data cloud-init-$VM_NAME.yaml \
+            --admin-username "$PROXY_USERNAME" \
+            --admin-password "$PROXY_PASSWORD" \
+            --only-show-errors
+            
+        # Obtenir l'IP de la nouvelle VM
+        IP=$(az vm show --resource-group "$RESOURCE_GROUP" --name "$VM_NAME" --show-details --query publicIps --output tsv)
+        format_proxy_data "$VM_NAME" "$IP" "$PROXY_PORT"
+        
+        # Configurer NSG pour la nouvelle VM
+        create_proxy_nsg "$VM_NAME"
+    fi
+done
 
     cat <<EOF > proxy-vars-$VM_NAME.sh
 VM_NAME="$VM_NAME"
@@ -343,27 +375,6 @@ runcmd:
     source /tmp/proxy-vars.sh
     /tmp/configure-proxy.sh
 EOF
-
-    # Créer la VM avec cloud-init
-    az vm create \
-        --resource-group "$RESOURCE_GROUP" \
-        --name "$VM_NAME" \
-        --image "$IMAGE" \
-        --size "$VM_SIZE" \
-        --custom-data cloud-init-$VM_NAME.yaml \
-        --admin-username "$PROXY_USERNAME" \
-        --admin-password "$PROXY_PASSWORD" \
-        --only-show-errors
-
-
-    # Créer et configurer le NSG pour cette machine proxy
-    create_proxy_nsg "$VM_NAME"
-
-    # Ajouter la nouvelle machine à HAProxy
-    IP=$(az vm show --resource-group "$RESOURCE_GROUP" --name "$VM_NAME" --show-details --query publicIps --output tsv)
-    HAPROXY_BACKENDS+="$VM_NAME $IP:3128"
-    HAPROXY_FRONTENDS+="$IP $PROXY_PORT"
-done
 
 # Générer un SAS Token valide pour le fichier de configuration du haproxy
 SAS_TOKEN_HAPROXY=$(az storage container generate-sas \
