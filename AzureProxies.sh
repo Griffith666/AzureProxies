@@ -1,11 +1,11 @@
 #!/bin/bash
 
 # Variables de configuration
-RESOURCE_GROUP="RG-Proxies"
+RESOURCE_GROUP="RG-Leo"
 LOCATION="eastus"
 VM_SIZE="Standard_B1s"
 IMAGE="Canonical:UbuntuServer:18.04-LTS:latest"
-STORAGE_ACCOUNT="storageproxies"
+STORAGE_ACCOUNT="storageproxiesleo"
 CONTAINER_NAME="scripts"
 PROXY_PORT_BASE=30000
 FRONTEND_VM="haproxy-vm"  # VM frontale pour HAProxy
@@ -64,118 +64,122 @@ echo "SAS Token généré pour le script de configuration du proxy : $SAS_TOKEN"
 SCRIPT_URL="https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/configure-proxy.sh?$SAS_TOKEN"
 
 
-
-cat <<EOF > configure-proxy.sh
+cat <<'EOF' > configure-proxy.sh
 #!/bin/bash
-# Fonction de logging
+
+# Configuration du logging
+exec 1> >(logger -s -t $(basename $0)) 2>&1
+
+# Fonction de logging améliorée
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    logger -t squid-setup "$1"
+}
+
+# Vérification des variables requises
+check_required_vars() {
+    local missing_vars=()
+    for var in VM_NAME PROXY_PORT PROXY_USERNAME PROXY_PASSWORD; do
+        if [ -z "${!var}" ]; then
+            missing_vars+=($var)
+        fi
+    done
+    
+    if [ ${#missing_vars[@]} -ne 0 ]; then
+        log "ERREUR: Variables manquantes: ${missing_vars[*]}"
+        exit 1
+    fi
+}
+
+# Fonction de vérification des installations
+verify_installation() {
+    local package=$1
+    if ! dpkg -l | grep -q "^ii.*$package"; then
+        log "ERREUR: $package n'est pas correctement installé"
+        return 1
+    fi
+    return 0
 }
 
 # Charger les variables de configuration
+if [ ! -f /tmp/proxy-vars.sh ]; then
+    log "ERREUR: Fichier de variables non trouvé"
+    exit 1
+fi
+
 source /tmp/proxy-vars.sh
+check_required_vars
 
 log "Configuration de Squid pour VM: $VM_NAME"
 log "Port: $PROXY_PORT, Username: $PROXY_USERNAME"
 
-# Installation des paquets nécessaires
-sudo apt update
-sudo apt install -y squid apache2-utils
+# Installation et vérification des paquets
+log "Vérification des paquets nécessaires..."
+for pkg in squid apache2-utils; do
+    if ! verify_installation $pkg; then
+        log "Installation de $pkg..."
+        apt-get update && apt-get install -y $pkg
+        if ! verify_installation $pkg; then
+            log "ERREUR: Échec de l'installation de $pkg"
+            exit 1
+        fi
+    fi
+done
 
-# Nettoyer les fichiers existants de Squid
+# Nettoyage avec vérification
 log "Nettoyage des fichiers Squid existants..."
-sudo systemctl stop squid
-sudo rm -rf /var/run/squid.pid
-sudo rm -rf /var/spool/squid/*
-sudo rm -rf /var/log/squid/*
+systemctl stop squid
+for dir in "/var/run/squid.pid" "/var/spool/squid" "/var/log/squid"; do
+    if [ -e "$dir" ]; then
+        rm -rf "$dir"
+        log "Nettoyage de $dir effectué"
+    fi
+done
 
-# Créer les répertoires nécessaires avec les bonnes permissions
-sudo mkdir -p /var/log/squid
-sudo mkdir -p /var/spool/squid
-sudo chown -R proxy:proxy /var/log/squid
-sudo chown -R proxy:proxy /var/spool/squid
-sudo chmod -R 755 /var/log/squid
-sudo chmod -R 755 /var/spool/squid
+# Création des répertoires avec vérification
+log "Création des répertoires..."
+for dir in "/var/log/squid" "/var/spool/squid"; do
+    mkdir -p "$dir"
+    chown -R proxy:proxy "$dir"
+    chmod -R 755 "$dir"
+    if [ ! -d "$dir" ]; then
+        log "ERREUR: Impossible de créer $dir"
+        exit 1
+    fi
+done
 
-# Configurer l'authentification
-log "Configuration de l'authentification..."
-sudo htpasswd -bc /etc/squid/squid_passwd "$PROXY_USERNAME" "$PROXY_PASSWORD"
+[... reste de votre script de configuration Squid ...]
 
-# Créer la configuration Squid
-log "Création de la configuration Squid..."
-sudo tee /etc/squid/squid.conf <<EOL
-# Paramètres d'authentification
-auth_param basic program /usr/lib/squid/basic_ncsa_auth /etc/squid/squid_passwd
-auth_param basic children 5
-auth_param basic realm Squid proxy-caching web server
-auth_param basic credentialsttl 2 hours
-auth_param basic casesensitive off
-
-# ACLs de base
-acl SSL_ports port 443
-acl CONNECT method CONNECT
-acl Safe_ports port 80          # http
-acl Safe_ports port 21          # ftp
-acl Safe_ports port 443         # https
-acl Safe_ports port 70          # gopher
-acl Safe_ports port 210         # wais
-acl Safe_ports port 1025-65535  # unregistered ports
-acl authenticated proxy_auth REQUIRED
-
-# Règles d'accès
-http_access deny !Safe_ports
-http_access deny CONNECT !SSL_ports
-http_access allow authenticated
-http_access deny all
-
-# Configuration du port et des options
-http_port 0.0.0.0:3128
-visible_hostname $(hostname -f)
-
-# Configuration des logs
-access_log /var/log/squid/access.log
-cache_log /var/log/squid/cache.log
-
-# Configuration du cache
-cache_dir ufs /var/spool/squid 100 16 256
-coredump_dir /var/spool/squid
-
-# Options supplémentaires pour améliorer les performances
-maximum_object_size 128 MB
-cache_mem 256 MB
-EOL
-
-# Initialiser le cache
-log "Initialisation du cache Squid..."
-sudo squid -z
-
-# Démarrer Squid
-log "Démarrage de Squid..."
-sudo systemctl enable squid
-sudo systemctl restart squid
-
-# Vérifier le statut
-if sudo systemctl is-active --quiet squid; then
-    log "Squid configuré et démarré avec succès sur le port 3128"
-    # Afficher les ports en écoute pour vérification
-    sudo netstat -tulpn | grep squid
-else
-    log "Erreur lors du démarrage de Squid"
-    sudo systemctl status squid
+# Vérification finale plus détaillée
+log "Vérification finale de la configuration..."
+if ! squid -k parse; then
+    log "ERREUR: La configuration de Squid contient des erreurs"
     exit 1
 fi
 
-# Vérifier les logs
-log "Vérification des logs Squid..."
-if [ -f "/var/log/squid/cache.log" ]; then
-    sudo tail -n 5 /var/log/squid/cache.log
-else
-    log "Fichier de log non trouvé"
+if ! systemctl restart squid; then
+    log "ERREUR: Impossible de redémarrer Squid"
+    journalctl -u squid --no-pager | tail -n 50
+    exit 1
 fi
+
+if ! systemctl is-active --quiet squid; then
+    log "ERREUR: Squid n'est pas actif après le redémarrage"
+    systemctl status squid
+    exit 1
+fi
+
+# Vérification du port d'écoute
+if ! netstat -tulpn | grep :3128; then
+    log "ERREUR: Squid n'écoute pas sur le port 3128"
+    exit 1
+fi
+
+log "Configuration de Squid terminée avec succès"
 EOF
 
 # Charger le script dans le Blob Storage
-az storage blob upload --account-name "$STORAGE_ACCOUNT" --account-key "$STORAGE_KEY" --container-name "$CONTAINER_NAME" --name "configure-proxy.sh" --file "configure-proxy.sh" --auth-mode login
+az storage blob upload --account-name "$STORAGE_ACCOUNT" --account-key "$STORAGE_KEY" --container-name "$CONTAINER_NAME" --name "configure-proxy.sh" --file "configure-proxy.sh" --auth-mode login --overwrite
 
 # Fonction pour créer le NSG et associer les règles de sécurité
 create_nsg_haproxy() {
@@ -274,6 +278,167 @@ update_nsg_haproxy() {
         done
 }
 
+# Script de mise à jour de la configuration HAProxy
+cat <<'EOF' > update_haproxy.sh
+#!/bin/bash
+
+# Fonction de logging
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+}
+
+log "Début de la mise à jour de la configuration HAProxy"
+
+# Vérifier l'existence des fichiers de configuration
+if [ ! -f "/tmp/haproxy_frontends.txt" ] || [ ! -f "/tmp/haproxy_backends.txt" ]; then
+    log "Erreur: Fichiers de configuration manquants"
+    exit 1
+fi
+
+# Créer la nouvelle configuration HAProxy
+log "Création de la nouvelle configuration HAProxy..."
+cat > /etc/haproxy/haproxy.cfg << 'EOL'
+global
+    log /dev/log local0
+    log /dev/log local1 notice
+    chroot /var/lib/haproxy
+    stats socket /run/haproxy/admin.sock mode 660 level admin expose-fd listeners
+    stats timeout 30s
+    user haproxy
+    group haproxy
+    daemon
+
+defaults
+    mode tcp
+    timeout connect 5000ms
+    timeout client  50000ms
+    timeout server  50000ms
+
+EOL
+
+# Initialiser les compteurs
+frontend_count=0
+backend_count=0
+
+# Traiter chaque ligne du fichier frontends
+while read line; do
+    if [ -z "$line" ]; then
+        continue
+    fi
+    
+    # Extraire IP et port
+    ip=$(echo $line | cut -d' ' -f1)
+    port=$(echo $line | cut -d' ' -f2)
+    
+    log "Mise à jour du frontend pour IP: $ip, Port: $port"
+    
+    # Vérifier que le port est un nombre
+    if ! [[ "$port" =~ ^[0-9]+$ ]]; then
+        log "Erreur: Port invalide '$port' pour l'IP $ip"
+        continue
+    fi
+
+    # Configurer le frontend
+    cat >> /etc/haproxy/haproxy.cfg << EOL
+frontend ft_${port}
+    bind *:${port}
+    mode tcp
+    default_backend bk_${port}
+
+EOL
+    frontend_count=$((frontend_count + 1))
+
+    # Rechercher le backend correspondant
+    vm_name="proxy-vm-${port}"
+    backend_line=$(grep "^$vm_name" /tmp/haproxy_backends.txt || echo "")
+
+    if [ -n "$backend_line" ]; then
+        # Extraire l'IP:port du backend
+        backend_ip_port=$(echo "$backend_line" | cut -d' ' -f2)
+        
+        # Configurer le backend
+        cat >> /etc/haproxy/haproxy.cfg << EOL
+backend bk_${port}
+    mode tcp
+    server ${vm_name} ${backend_ip_port} check
+
+EOL
+        backend_count=$((backend_count + 1))
+        log "Backend mis à jour pour ${vm_name} avec ${backend_ip_port}"
+    else
+        log "Attention: Aucun backend trouvé pour le port ${port}"
+    fi
+done < /tmp/haproxy_frontends.txt
+
+# Vérifier qu'au moins une configuration a été créée
+if [ $frontend_count -eq 0 ] || [ $backend_count -eq 0 ]; then
+    log "Erreur: Aucune configuration frontend/backend valide n'a été créée"
+    exit 1
+fi
+
+log "Configuration mise à jour avec $frontend_count frontends et $backend_count backends"
+
+# Ajouter la configuration des stats
+cat >> /etc/haproxy/haproxy.cfg << 'EOL'
+frontend stats
+    bind *:8404
+    mode http
+    stats enable
+    stats uri /stats
+    stats refresh 10s
+    stats admin if LOCALHOST
+EOL
+
+# Vérifier et appliquer la configuration
+log "Vérification de la nouvelle configuration HAProxy..."
+if haproxy -c -f /etc/haproxy/haproxy.cfg; then
+    log "Configuration valide"
+    systemctl restart haproxy
+    if systemctl is-active --quiet haproxy; then
+        log "HAProxy redémarré avec succès"
+        log "Ports en écoute:"
+        netstat -tlnp | grep haproxy
+    else
+        log "Erreur: HAProxy n'a pas démarré correctement"
+        systemctl status haproxy
+        exit 1
+    fi
+else
+    log "Erreur dans la configuration HAProxy"
+    exit 1
+fi
+EOF
+
+# Charger le script dans le Blob Storage
+az storage blob upload \
+    --account-name "$STORAGE_ACCOUNT" \
+    --account-key "$STORAGE_KEY" \
+    --container-name "$CONTAINER_NAME" \
+    --name "update_haproxy.sh" \
+    --file "update_haproxy.sh" \
+    --auth-mode login \
+    --overwrite
+
+# Fonction de mise à jour de HAProxy
+update_haproxy_configuration() {
+    echo "Mise à jour de la configuration HAProxy..."
+    
+    # Créer les fichiers de configuration temporaires
+    echo -e "$HAPROXY_FRONTENDS" > haproxy_frontends.txt
+    echo -e "$HAPROXY_BACKENDS" > haproxy_backends.txt
+    
+    # Copier les fichiers de configuration vers la VM HAProxy
+    az vm run-command invoke \
+        --resource-group "$RESOURCE_GROUP" \
+        --name "$FRONTEND_VM" \
+        --command-id RunShellScript \
+        --scripts "curl -o /tmp/update_haproxy.sh https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/update_haproxy.sh?$SAS_TOKEN" \
+        "curl -o /tmp/haproxy_frontends.txt https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/haproxy_frontends.txt?$SAS_TOKEN" \
+        "curl -o /tmp/haproxy_backends.txt https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/haproxy_backends.txt?$SAS_TOKEN" \
+        "chmod +x /tmp/update_haproxy.sh" \
+        "/tmp/update_haproxy.sh"
+}
+
 # Liste des backends existants pour HAProxy
 HAPROXY_BACKENDS=""
 HAPROXY_FRONTENDS=""
@@ -293,6 +458,7 @@ for VM in $EXISTING_VMS; do
     fi
 done
 
+
 # Créer les nouvelles machines et ajouter leurs configurations
 for ((i=0; i<MACHINE_COUNT; i++)); do
     PROXY_PORT=$((PROXY_PORT_BASE + i))
@@ -311,11 +477,7 @@ for ((i=0; i<MACHINE_COUNT; i++)); do
             --admin-username "$PROXY_USERNAME" \
             --admin-password "$PROXY_PASSWORD" \
             --only-show-errors
-        
-        # Attendre que la VM soit complètement créée et obtenir son IP
-        echo "Attente de l'IP de la VM $VM_NAME..."
-        sleep 30  # Attendre que l'IP soit attribuée
-        
+                
         PROXY_IP=$(az vm show --resource-group "$RESOURCE_GROUP" --name "$VM_NAME" --show-details --query publicIps --output tsv)
         
         if [ -n "$PROXY_IP" ]; then
@@ -329,11 +491,7 @@ for ((i=0; i<MACHINE_COUNT; i++)); do
     fi
 done
 
-# Debug: Afficher les configurations avant de créer les fichiers
-echo "Configuration Frontends:"
-echo -e "$HAPROXY_FRONTENDS"
-echo "Configuration Backends:"
-echo -e "$HAPROXY_BACKENDS"
+update_haproxy_configuration
 
     cat <<EOF > proxy-vars-$VM_NAME.sh
 VM_NAME="$VM_NAME"
@@ -343,7 +501,7 @@ PROXY_PASSWORD="$PROXY_PASSWORD"
 EOF
 
   # Charger le fichier de variables dans le stockage Azure
-    az storage blob upload --account-name "$STORAGE_ACCOUNT" --account-key "$STORAGE_KEY" --container-name "$CONTAINER_NAME" --name "proxy-vars-$VM_NAME.sh" --file "proxy-vars-$VM_NAME.sh" --auth-mode login
+    az storage blob upload --account-name "$STORAGE_ACCOUNT" --account-key "$STORAGE_KEY" --container-name "$CONTAINER_NAME" --name "proxy-vars-$VM_NAME.sh" --file "proxy-vars-$VM_NAME.sh" --auth-mode login --overwrite
 
     # Générer le cloud-init pour chaque VM proxy
     cat <<EOF > cloud-init-$VM_NAME.yaml
@@ -357,17 +515,104 @@ users:
     ssh_authorized_keys:
       - $SSH_PUBLIC_KEY
 
+write_files:
+  - path: /tmp/setup_logging.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      exec 1> >(logger -s -t $(basename $0)) 2>&1
+      
+  - path: /tmp/install_deps.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      source /tmp/setup_logging.sh
+      echo "Installation des dépendances..."
+      until apt-get update && apt-get install -y curl jq squid apache2-utils; do
+        echo "Échec de l'installation, nouvelle tentative dans 10 secondes..."
+        sleep 10
+      done
+
 package_update: true
 package_upgrade: true
 
 runcmd:
-  - echo "Downloading script for $VM_NAME..."
-  - curl -o /tmp/configure-proxy.sh "$SCRIPT_URL"
-  - curl -o /tmp/proxy-vars.sh "https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/proxy-vars-$VM_NAME.sh?$SAS_TOKEN"
-  - chmod +x /tmp/configure-proxy.sh /tmp/proxy-vars.sh
+  # Mise en place du logging
   - |
+    exec 1> >(logger -s -t $(basename $0)) 2>&1
+    echo "Démarrage de la configuration de la VM Squid..."
+    
+  # Installation des dépendances
+  - bash /tmp/install_deps.sh
+  
+  # Téléchargement des scripts avec gestion d'erreur et retry
+  - |
+    MAX_RETRIES=5
+    RETRY_DELAY=10
+    
+    download_with_retry() {
+      local url=\$1
+      local output=\$2
+      local attempt=1
+      
+      while [ \$attempt -le \$MAX_RETRIES ]; do
+        echo "Tentative \$attempt de téléchargement de \$output"
+        if curl -s -f -o \$output "\$url"; then
+          echo "Téléchargement réussi de \$output"
+          return 0
+        else
+          echo "Échec du téléchargement (tentative \$attempt)"
+          sleep \$RETRY_DELAY
+          attempt=\$((attempt + 1))
+        fi
+      done
+      
+      echo "Échec après \$MAX_RETRIES tentatives"
+      return 1
+    }
+    
+    # Téléchargement du script de configuration
+    if ! download_with_retry "$SCRIPT_URL" "/tmp/configure-proxy.sh"; then
+      echo "ERREUR: Impossible de télécharger le script de configuration"
+      exit 1
+    fi
+    
+    # Téléchargement des variables
+    if ! download_with_retry "https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/proxy-vars-$VM_NAME.sh?$SAS_TOKEN" "/tmp/proxy-vars.sh"; then
+      echo "ERREUR: Impossible de télécharger les variables"
+      exit 1
+    fi
+    
+  # Vérification et exécution des scripts
+  - |
+    chmod +x /tmp/configure-proxy.sh /tmp/proxy-vars.sh
+    
+    # Vérification du contenu des fichiers
+    echo "Contenu de proxy-vars.sh:"
+    cat /tmp/proxy-vars.sh
+    
+    if [ ! -s /tmp/proxy-vars.sh ]; then
+      echo "ERREUR: Le fichier proxy-vars.sh est vide"
+      exit 1
+    fi
+    
+    if [ ! -s /tmp/configure-proxy.sh ]; then
+      echo "ERREUR: Le fichier configure-proxy.sh est vide"
+      exit 1
+    fi
+    
+    # Exécution des scripts
     source /tmp/proxy-vars.sh
-    /tmp/configure-proxy.sh
+    bash /tmp/configure-proxy.sh
+    
+  # Vérification finale
+  - |
+    if ! systemctl is-active --quiet squid; then
+      echo "ERREUR: Squid n'est pas en cours d'exécution"
+      systemctl status squid
+      exit 1
+    fi
+    echo "Configuration de Squid terminée avec succès"
 EOF
 
 # Générer un SAS Token valide pour le fichier de configuration du haproxy
@@ -401,7 +646,7 @@ EOF
 
 
 # Charger le fichier de variables HAProxy dans le stockage Azure
-az storage blob upload --account-name "$STORAGE_ACCOUNT" --account-key "$STORAGE_KEY" --container-name "$CONTAINER_NAME" --name "haproxy-vars.sh" --file "haproxy-vars.sh" --auth-mode login
+az storage blob upload --account-name "$STORAGE_ACCOUNT" --account-key "$STORAGE_KEY" --container-name "$CONTAINER_NAME" --name "haproxy-vars.sh" --file "haproxy-vars.sh" --auth-mode login --overwrite
 
 # Créer le fichier cloud-init pour HAProxy avec les configurations intégrées
 cat <<EOF > cloud-init-haproxy.yaml
@@ -581,7 +826,7 @@ else
 fi
 EOFSCRIPT
 
-az storage blob upload --account-name "$STORAGE_ACCOUNT" --account-key "$STORAGE_KEY" --container-name "$CONTAINER_NAME" --name "configure-haproxy.sh" --file "configure-haproxy.sh" --auth-mode login
+az storage blob upload --account-name "$STORAGE_ACCOUNT" --account-key "$STORAGE_KEY" --container-name "$CONTAINER_NAME" --name "configure-haproxy.sh" --file "configure-haproxy.sh" --auth-mode login --overwrite
 
 
 # Créer ou mettre à jour la machine HAProxy
