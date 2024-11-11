@@ -1,13 +1,17 @@
 #!/bin/bash
 
 # Variables de configuration
-RESOURCE_GROUP="RG-Proxies"
+RESOURCE_GROUP="RG-Leo"
+SUBSCRIPTION_ID=""  # Optionnel : si vous voulez forcer une subscription spécifique
 
 # Variables pour les couleurs
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
+
+# Tableau global pour stocker les noms des VMs
+declare -a VM_NAMES
 
 # Fonction pour afficher les messages d'erreur
 error_msg() {
@@ -35,33 +39,140 @@ get_vm_list() {
         return 1
     fi
 
+    # Réinitialiser le tableau des VMs
+    VM_NAMES=()
+
     # En-tête du tableau
-    printf "%-20s %-15s\n" "Nom" "Statut"
-    printf "%-20s %-15s\n" "--------------------" "---------------"
+    printf "%-5s %-20s %-15s\n" "#" "Nom" "Statut"
+    printf "%-5s %-20s %-15s\n" "---" "--------------------" "---------------"
+
+    # Compteur pour la numérotation
+    local counter=1
 
     # Récupérer la liste des VMs et leur statut
-    az vm list \
+    while IFS=$'\t' read -r name powerState; do
+        # Ajouter le nom de la VM au tableau global
+        VM_NAMES+=("$name")
+        
+        # Définir la couleur en fonction du statut
+        if [[ "$powerState" == *"running"* ]]; then
+            status_color=$GREEN
+            status="RUNNING"
+        else
+            status_color=$YELLOW
+            status="STOPPED"
+        fi
+        
+        # Afficher la ligne avec la couleur appropriée
+        printf "%-5s %-20s ${status_color}%-15s${NC}\n" "$counter" "$name" "$status"
+        
+        ((counter++))
+    done < <(az vm list \
         --resource-group "$RESOURCE_GROUP" \
         --show-details \
         --query "[].{name:name, powerState:powerState}" \
-        -o tsv | while read -r name powerState; do
-            # Définir la couleur en fonction du statut
-            if [[ "$powerState" == *"running"* ]]; then
-                status_color=$GREEN
-                status="RUNNING"
-            else
-                status_color=$YELLOW
-                status="STOPPED"
-            fi
-            
-            # Afficher la ligne avec la couleur appropriée
-            printf "%-20s ${status_color}%-15s${NC}\n" "$name" "$status"
-        done
+        -o tsv)
 
     echo
 }
 
-# [Le reste du script reste identique...]
+# Fonction pour convertir la sélection en noms de VMs
+convert_selection_to_names() {
+    local selection=$1
+    local selected_vms=()
+    
+    # Diviser la sélection par virgules
+    IFS=',' read -ra numbers <<< "$selection"
+    
+    # Pour chaque numéro sélectionné
+    for num in "${numbers[@]}"; do
+        # Enlever les espaces
+        num=$(echo "$num" | tr -d ' ')
+        
+        # Vérifier si le numéro est valide
+        if [[ "$num" =~ ^[0-9]+$ ]] && [ "$num" -ge 1 ] && [ "$num" -le "${#VM_NAMES[@]}" ]; then
+            selected_vms+=("${VM_NAMES[$num-1]}")
+        else
+            error_msg "Numéro invalide: $num"
+            return 1
+        fi
+    done
+    
+    echo "${selected_vms[@]}"
+}
+
+# Fonction pour démarrer/arrêter une ou plusieurs VMs
+manage_vm_power() {
+    local action=$1
+    local selection=$2
+    
+    if [ "$action" != "start" ] && [ "$action" != "stop" ]; then
+        error_msg "Action invalide. Utilisez 'start' ou 'stop'"
+        return 1
+    fi
+    
+    if [ -n "$selection" ]; then
+        # Convertir la sélection en noms de VMs
+        local vm_names=$(convert_selection_to_names "$selection")
+        if [ $? -ne 0 ]; then
+            return 1
+        fi
+        
+        for vm in $vm_names; do
+            info_msg " $action VM $vm..."
+            if az vm $action --resource-group "$RESOURCE_GROUP" --name "$vm" --no-wait; then
+                success_msg "Action $action lancée pour $vm"
+            else
+                error_msg "Échec de l'action $action pour $vm"
+            fi
+        done
+    else
+        info_msg "Application de l'action $action sur toutes les VMs..."
+        for vm in "${VM_NAMES[@]}"; do
+            info_msg "- $action VM: $vm"
+            if az vm $action --resource-group "$RESOURCE_GROUP" --name "$vm" --no-wait; then
+                success_msg "Action $action lancée pour $vm"
+            else
+                error_msg "Échec de l'action $action pour $vm"
+            fi
+        done
+    fi
+}
+
+# Fonction pour supprimer une ou plusieurs VMs
+delete_vms() {
+    local selection=$1
+    
+    if [ -n "$selection" ]; then
+        # Convertir la sélection en noms de VMs
+        local vm_names=$(convert_selection_to_names "$selection")
+        if [ $? -ne 0 ]; then
+            return 1
+        fi
+        
+        for vm in $vm_names; do
+            info_msg "Suppression de la VM $vm..."
+            if az vm delete --resource-group "$RESOURCE_GROUP" --name "$vm" --yes --no-wait; then
+                success_msg "Suppression de $vm lancée"
+            else
+                error_msg "Échec de la suppression de $vm"
+            fi
+        done
+    else
+        info_msg "ATTENTION: Vous allez supprimer toutes les VMs!"
+        read -p "Êtes-vous sûr? (oui/non): " confirm
+        if [ "$confirm" = "oui" ]; then
+            for vm in "${VM_NAMES[@]}"; do
+                info_msg "- Suppression VM: $vm"
+                if az vm delete --resource-group "$RESOURCE_GROUP" --name "$vm" --yes --no-wait; then
+                    success_msg "Suppression de $vm lancée"
+                else
+                    error_msg "Échec de la suppression de $vm"
+                fi
+            done
+        fi
+    fi
+}
 
 # Menu principal
 main() {
@@ -92,12 +203,12 @@ main() {
             1|2)
                 action="start"
                 [ "$choice" -eq 2 ] && action="stop"
-                read -p "Nom de la VM (vide pour toutes): " vm_name
-                manage_vm_power "$action" "$vm_name"
+                read -p "Numéros des VMs (séparés par des virgules, vide pour toutes): " vm_selection
+                manage_vm_power "$action" "$vm_selection"
                 ;;
             3)
-                read -p "Nom de la VM (vide pour toutes): " vm_name
-                delete_vms "$vm_name"
+                read -p "Numéros des VMs (séparés par des virgules, vide pour toutes): " vm_selection
+                delete_vms "$vm_selection"
                 ;;
             4)
                 success_msg "Au revoir!"
