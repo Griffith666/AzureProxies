@@ -43,14 +43,14 @@ get_vm_list() {
     VM_NAMES=()
 
     # En-tête du tableau
-    printf "%-5s %-20s %-15s\n" "#" "Nom" "Statut"
-    printf "%-5s %-20s %-15s\n" "---" "--------------------" "---------------"
+    printf "%-5s %-20s %-15s %-15s\n" "#" "Nom" "Statut" "IP Publique"
+    printf "%-5s %-20s %-15s %-15s\n" "---" "--------------------" "---------------" "---------------"
 
     # Compteur pour la numérotation
     local counter=1
 
     # Récupérer la liste des VMs et leur statut
-    while IFS=$'\t' read -r name powerState; do
+    while IFS=$'\t' read -r name powerState publicIP; do
         # Ajouter le nom de la VM au tableau global
         VM_NAMES+=("$name")
         
@@ -62,15 +62,20 @@ get_vm_list() {
             status_color=$YELLOW
             status="STOPPED"
         fi
+
+        # Si l'IP est vide, afficher "Non attribuée"
+        if [ -z "$publicIP" ]; then
+            publicIP="Non attribuée"
+        fi
         
         # Afficher la ligne avec la couleur appropriée
-        printf "%-5s %-20s ${status_color}%-15s${NC}\n" "$counter" "$name" "$status"
+        printf "%-5s %-20s ${status_color}%-15s${NC} %-15s\n" "$counter" "$name" "$status" "$publicIP"
         
         ((counter++))
     done < <(az vm list \
         --resource-group "$RESOURCE_GROUP" \
         --show-details \
-        --query "[].{name:name, powerState:powerState}" \
+        --query "[].{name:name, powerState:powerState, publicIps:publicIps}" \
         -o tsv)
 
     echo
