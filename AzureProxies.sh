@@ -1,11 +1,11 @@
 #!/bin/bash
 
 # Variables de configuration
-RESOURCE_GROUP="RG-Leo"
+RESOURCE_GROUP="RG-Proxies"
 LOCATION="eastus"
 VM_SIZE="Standard_B1s"
 IMAGE="Canonical:UbuntuServer:18.04-LTS:latest"
-STORAGE_ACCOUNT="storageproxiesleo"
+STORAGE_ACCOUNT="storageproxies"
 CONTAINER_NAME="scripts"
 PROXY_PORT_BASE=30000
 FRONTEND_VM="haproxy-vm"  # VM frontale pour HAProxy
@@ -54,8 +54,9 @@ az storage container create --name "$CONTAINER_NAME" --account-name "$STORAGE_AC
 SAS_TOKEN=$(az storage container generate-sas \
     --account-name "$STORAGE_ACCOUNT" \
     --name "$CONTAINER_NAME" \
-    --permissions lr \
+    --permissions racwdl \
     --expiry "$(date -u -d '1 day' '+%Y-%m-%dT%H:%MZ')" \
+    --https-only \
     --output tsv)
 
 echo "SAS Token généré pour le script de configuration du proxy : $SAS_TOKEN"
@@ -423,20 +424,66 @@ az storage blob upload \
 update_haproxy_configuration() {
     echo "Mise à jour de la configuration HAProxy..."
     
-    # Créer les fichiers de configuration temporaires
+    # Créer les fichiers de configuration temporaires sur le blob storage
     echo -e "$HAPROXY_FRONTENDS" > haproxy_frontends.txt
     echo -e "$HAPROXY_BACKENDS" > haproxy_backends.txt
     
-    # Copier les fichiers de configuration vers la VM HAProxy
+    # Upload des fichiers vers le blob storage
+    az storage blob upload \
+        --account-name "$STORAGE_ACCOUNT" \
+        --account-key "$STORAGE_KEY" \
+        --container-name "$CONTAINER_NAME" \
+        --name "haproxy_frontends.txt" \
+        --file "haproxy_frontends.txt" \
+        --overwrite
+        
+    az storage blob upload \
+        --account-name "$STORAGE_ACCOUNT" \
+        --account-key "$STORAGE_KEY" \
+        --container-name "$CONTAINER_NAME" \
+        --name "haproxy_backends.txt" \
+        --file "haproxy_backends.txt" \
+        --overwrite
+
+    # Construction des URLs avec SAS Token
+    local frontends_url="https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/haproxy_frontends.txt?$SAS_TOKEN"
+    local backends_url="https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/haproxy_backends.txt?$SAS_TOKEN"
+    local script_url="https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/update_haproxy.sh?$SAS_TOKEN"
+
+    # Commande d'exécution sur la VM avec retry
     az vm run-command invoke \
         --resource-group "$RESOURCE_GROUP" \
         --name "$FRONTEND_VM" \
         --command-id RunShellScript \
-        --scripts "curl -o /tmp/update_haproxy.sh https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/update_haproxy.sh?$SAS_TOKEN" \
-        "curl -o /tmp/haproxy_frontends.txt https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/haproxy_frontends.txt?$SAS_TOKEN" \
-        "curl -o /tmp/haproxy_backends.txt https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/haproxy_backends.txt?$SAS_TOKEN" \
-        "chmod +x /tmp/update_haproxy.sh" \
-        "/tmp/update_haproxy.sh"
+        --scripts "
+            # Fonction de téléchargement avec retry
+            download_with_retry() {
+                local url=\$1
+                local output=\$2
+                local max_attempts=5
+                local attempt=1
+                
+                while [ \$attempt -le \$max_attempts ]; do
+                    echo \"Tentative \$attempt de téléchargement de \$output\"
+                    if curl -s -f -L -o \$output \"\$url\"; then
+                        echo \"Téléchargement réussi de \$output\"
+                        return 0
+                    else
+                        echo \"Échec du téléchargement (tentative \$attempt)\"
+                        sleep 10
+                        attempt=\$((attempt + 1))
+                    fi
+                done
+                return 1
+            }
+
+            # Téléchargement des fichiers
+            download_with_retry \"$frontends_url\" \"/tmp/haproxy_frontends.txt\" && \
+            download_with_retry \"$backends_url\" \"/tmp/haproxy_backends.txt\" && \
+            download_with_retry \"$script_url\" \"/tmp/update_haproxy.sh\" && \
+            chmod +x /tmp/update_haproxy.sh && \
+            /tmp/update_haproxy.sh
+        "
 }
 
 # Liste des backends existants pour HAProxy
@@ -506,113 +553,53 @@ EOF
     # Générer le cloud-init pour chaque VM proxy
     cat <<EOF > cloud-init-$VM_NAME.yaml
 #cloud-config
-hostname: $VM_NAME
-users:
-  - name: $PROXY_USERNAME
-    sudo: ALL=(ALL) NOPASSWD:ALL
-    groups: sudo
-    shell: /bin/bash
-    ssh_authorized_keys:
-      - $SSH_PUBLIC_KEY
-
 write_files:
-  - path: /tmp/setup_logging.sh
+  - path: /tmp/download_scripts.sh
     permissions: '0755'
     content: |
       #!/bin/bash
-      exec 1> >(logger -s -t $(basename $0)) 2>&1
-      
-  - path: /tmp/install_deps.sh
-    permissions: '0755'
-    content: |
-      #!/bin/bash
-      source /tmp/setup_logging.sh
-      echo "Installation des dépendances..."
-      until apt-get update && apt-get install -y curl jq squid apache2-utils; do
-        echo "Échec de l'installation, nouvelle tentative dans 10 secondes..."
-        sleep 10
-      done
+      download_with_retry() {
+          local url=\$1
+          local output=\$2
+          local max_attempts=5
+          local attempt=1
+          
+          while [ \$attempt -le \$max_attempts ]; do
+              echo "Tentative \$attempt de téléchargement de \$output"
+              if curl -s -f -L -o \$output "\$url"; then
+                  echo "Téléchargement réussi de \$output"
+                  return 0
+              else
+                  echo "Échec du téléchargement (tentative \$attempt)"
+                  sleep 10
+                  attempt=\$((attempt + 1))
+              fi
+          done
+          return 1
+      }
+
+      # URLs avec SAS Token
+      SCRIPT_URL="https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/configure-proxy.sh?$SAS_TOKEN"
+      VARS_URL="https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/proxy-vars-$VM_NAME.sh?$SAS_TOKEN"
+
+      # Téléchargement des scripts
+      download_with_retry "\$SCRIPT_URL" "/tmp/configure-proxy.sh"
+      download_with_retry "\$VARS_URL" "/tmp/proxy-vars.sh"
+
+      # Rendre les scripts exécutables
+      chmod +x /tmp/configure-proxy.sh /tmp/proxy-vars.sh
 
 package_update: true
 package_upgrade: true
+packages:
+  - squid
+  - apache2-utils
+  - curl
 
 runcmd:
-  # Mise en place du logging
-  - |
-    exec 1> >(logger -s -t $(basename $0)) 2>&1
-    echo "Démarrage de la configuration de la VM Squid..."
-    
-  # Installation des dépendances
-  - bash /tmp/install_deps.sh
-  
-  # Téléchargement des scripts avec gestion d'erreur et retry
-  - |
-    MAX_RETRIES=5
-    RETRY_DELAY=10
-    
-    download_with_retry() {
-      local url=\$1
-      local output=\$2
-      local attempt=1
-      
-      while [ \$attempt -le \$MAX_RETRIES ]; do
-        echo "Tentative \$attempt de téléchargement de \$output"
-        if curl -s -f -o \$output "\$url"; then
-          echo "Téléchargement réussi de \$output"
-          return 0
-        else
-          echo "Échec du téléchargement (tentative \$attempt)"
-          sleep \$RETRY_DELAY
-          attempt=\$((attempt + 1))
-        fi
-      done
-      
-      echo "Échec après \$MAX_RETRIES tentatives"
-      return 1
-    }
-    
-    # Téléchargement du script de configuration
-    if ! download_with_retry "$SCRIPT_URL" "/tmp/configure-proxy.sh"; then
-      echo "ERREUR: Impossible de télécharger le script de configuration"
-      exit 1
-    fi
-    
-    # Téléchargement des variables
-    if ! download_with_retry "https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/proxy-vars-$VM_NAME.sh?$SAS_TOKEN" "/tmp/proxy-vars.sh"; then
-      echo "ERREUR: Impossible de télécharger les variables"
-      exit 1
-    fi
-    
-  # Vérification et exécution des scripts
-  - |
-    chmod +x /tmp/configure-proxy.sh /tmp/proxy-vars.sh
-    
-    # Vérification du contenu des fichiers
-    echo "Contenu de proxy-vars.sh:"
-    cat /tmp/proxy-vars.sh
-    
-    if [ ! -s /tmp/proxy-vars.sh ]; then
-      echo "ERREUR: Le fichier proxy-vars.sh est vide"
-      exit 1
-    fi
-    
-    if [ ! -s /tmp/configure-proxy.sh ]; then
-      echo "ERREUR: Le fichier configure-proxy.sh est vide"
-      exit 1
-    fi
-    
-    # Exécution des scripts
-    source /tmp/proxy-vars.sh
-    bash /tmp/configure-proxy.sh
-    
-  # Vérification finale
-  - |
-    if ! systemctl is-active --quiet squid; then
-      echo "ERREUR: Squid n'est pas en cours d'exécution"
-      systemctl status squid
-      exit 1
-    fi
-    echo "Configuration de Squid terminée avec succès"
+  - bash /tmp/download_scripts.sh
+  - source /tmp/proxy-vars.sh
+  - bash /tmp/configure-proxy.sh
 EOF
 
 # Générer un SAS Token valide pour le fichier de configuration du haproxy
@@ -828,8 +815,9 @@ EOFSCRIPT
 
 az storage blob upload --account-name "$STORAGE_ACCOUNT" --account-key "$STORAGE_KEY" --container-name "$CONTAINER_NAME" --name "configure-haproxy.sh" --file "configure-haproxy.sh" --auth-mode login --overwrite
 
+# 4. Vérification de l'existence de la VM HAProxy avant création
+EXISTING_HAPROXY=$(az vm show --resource-group "$RESOURCE_GROUP" --name "$FRONTEND_VM" --query "name" --output tsv 2>/dev/null || echo "")
 
-# Créer ou mettre à jour la machine HAProxy
 if [[ -z "$EXISTING_HAPROXY" ]]; then
     echo "Création de la machine HAProxy..."
     az vm create \
@@ -842,10 +830,9 @@ if [[ -z "$EXISTING_HAPROXY" ]]; then
         --custom-data cloud-init-haproxy.yaml \
         --only-show-errors
 else
-    echo "Mise à jour de la configuration de HAProxy..."
+    echo "Machine HAProxy existante, mise à jour de la configuration..."
+    update_haproxy_configuration
 fi
-
-
 
 # Mettre à jour le NSG avec les nouveaux ports
 update_nsg_haproxy
