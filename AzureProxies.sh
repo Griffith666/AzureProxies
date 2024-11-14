@@ -1,11 +1,11 @@
 #!/bin/bash
 
 # Variables de configuration
-RESOURCE_GROUP="RG-Proxies"
+RESOURCE_GROUP="RG-Leo"
 LOCATION="eastus"
 VM_SIZE="Standard_B1s"
 IMAGE="Canonical:UbuntuServer:18.04-LTS:latest"
-STORAGE_ACCOUNT="storageproxies"
+STORAGE_ACCOUNT="storageproxiesleo"
 CONTAINER_NAME="scripts"
 PROXY_PORT_BASE=30000
 FRONTEND_VM="haproxy-vm"  # VM frontale pour HAProxy
@@ -506,39 +506,84 @@ for VM in $EXISTING_VMS; do
 done
 
 
-# Créer les nouvelles machines et ajouter leurs configurations
-for ((i=0; i<MACHINE_COUNT; i++)); do
-    PROXY_PORT=$((PROXY_PORT_BASE + i))
-    VM_NAME="proxy-vm-$PROXY_PORT"
-    
-    # Vérifier si la VM existe déjà
-    if ! az vm show --resource-group "$RESOURCE_GROUP" --name "$VM_NAME" &>/dev/null; then
-        # Créer nouvelle VM et configurer
-        echo "Création de la nouvelle VM $VM_NAME..."
-        az vm create \
-            --resource-group "$RESOURCE_GROUP" \
-            --name "$VM_NAME" \
-            --image "$IMAGE" \
-            --size "$VM_SIZE" \
-            --custom-data cloud-init-$VM_NAME.yaml \
-            --admin-username "$PROXY_USERNAME" \
-            --admin-password "$PROXY_PASSWORD" \
-            --only-show-errors
-                
-        PROXY_IP=$(az vm show --resource-group "$RESOURCE_GROUP" --name "$VM_NAME" --show-details --query publicIps --output tsv)
-        
-        if [ -n "$PROXY_IP" ]; then
-            # Ajouter l'entrée frontend et backend
-            HAPROXY_FRONTENDS="${HAPROXY_FRONTENDS}${PROXY_IP} ${PROXY_PORT}\n"
-            HAPROXY_BACKENDS="${HAPROXY_BACKENDS}${VM_NAME} ${PROXY_IP}:3128\n"
-        fi
-        
-        # Configurer NSG pour la nouvelle VM
-        create_proxy_nsg "$VM_NAME"
-    fi
-done
+create_cloud_init() {
+    local VM_NAME=$1
+    local YAML_CONTENT=$(cat <<EOF
+#cloud-config
+write_files:
+  - path: /tmp/download_scripts.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      exec 1> >(logger -s -t $(basename \$0)) 2>&1
+      
+      log() {
+          echo "[\$(date '+%Y-%m-%d %H:%M:%S')] \$1"
+          logger -t squid-setup "\$1"
+      }
+      
+      download_with_retry() {
+          local url=\$1
+          local output=\$2
+          local max_attempts=5
+          local attempt=1
+          
+          while [ \$attempt -le \$max_attempts ]; do
+              log "Tentative \$attempt de téléchargement de \$output"
+              if curl -s -f -L -o "\$output" "\$url"; then
+                  log "Téléchargement réussi de \$output"
+                  return 0
+              else
+                  log "Échec du téléchargement (tentative \$attempt)"
+                  sleep 10
+                  attempt=\$((attempt + 1))
+              fi
+          done
+          return 1
+      }
 
-update_haproxy_configuration
+      # URLs avec SAS Token
+      SCRIPT_URL="${SCRIPT_URL}"
+      VARS_URL="${VARS_URL}"
+      
+      log "Début du téléchargement des scripts..."
+      download_with_retry "\$SCRIPT_URL" "/tmp/configure-proxy.sh" || exit 1
+      download_with_retry "\$VARS_URL" "/tmp/proxy-vars.sh" || exit 1
+      
+      chmod +x /tmp/configure-proxy.sh /tmp/proxy-vars.sh
+      log "Scripts rendus exécutables"
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - squid
+  - apache2-utils
+  - curl
+  - net-tools
+
+runcmd:
+  - |
+    exec 1> >(logger -s -t cloud-init-runcmd) 2>&1
+    echo "Démarrage de la configuration Squid"
+    
+    # Export des variables
+    export SCRIPT_URL="https://${STORAGE_ACCOUNT}.blob.core.windows.net/${CONTAINER_NAME}/configure-proxy.sh?${SAS_TOKEN}"
+    export VARS_URL="https://${STORAGE_ACCOUNT}.blob.core.windows.net/${CONTAINER_NAME}/proxy-vars-${VM_NAME}.sh?${SAS_TOKEN}"
+    
+    # Exécution des scripts
+    bash /tmp/download_scripts.sh
+    if [ -f /tmp/proxy-vars.sh ] && [ -f /tmp/configure-proxy.sh ]; then
+        source /tmp/proxy-vars.sh
+        bash /tmp/configure-proxy.sh
+    else
+        echo "ERREUR: Scripts de configuration manquants"
+        exit 1
+    fi
+EOF
+)
+    echo "$YAML_CONTENT"
+}
 
     cat <<EOF > proxy-vars-$VM_NAME.sh
 VM_NAME="$VM_NAME"
@@ -551,46 +596,20 @@ EOF
     az storage blob upload --account-name "$STORAGE_ACCOUNT" --account-key "$STORAGE_KEY" --container-name "$CONTAINER_NAME" --name "proxy-vars-$VM_NAME.sh" --file "proxy-vars-$VM_NAME.sh" --auth-mode login --overwrite
 
     # Générer le cloud-init pour chaque VM proxy
-    cat <<EOF > cloud-init-$VM_NAME.yaml
+cat <<EOF > "cloud-init-$VM_NAME.yaml"
 #cloud-config
 write_files:
   - path: /tmp/download_scripts.sh
     permissions: '0755'
     content: |
       #!/bin/bash
-      download_with_retry() {
-          local url=\$1
-          local output=\$2
-          local max_attempts=5
-          local attempt=1
-          
-          while [ \$attempt -le \$max_attempts ]; do
-              echo "Tentative \$attempt de téléchargement de \$output"
-              if curl -s -f -L -o \$output "\$url"; then
-                  echo "Téléchargement réussi de \$output"
-                  return 0
-              else
-                  echo "Échec du téléchargement (tentative \$attempt)"
-                  sleep 10
-                  attempt=\$((attempt + 1))
-              fi
-          done
-          return 1
-      }
-
-      # URLs avec SAS Token
-      SCRIPT_URL="https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/configure-proxy.sh?$SAS_TOKEN"
-      VARS_URL="https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/proxy-vars-$VM_NAME.sh?$SAS_TOKEN"
-
-      # Téléchargement des scripts
-      download_with_retry "\$SCRIPT_URL" "/tmp/configure-proxy.sh"
-      download_with_retry "\$VARS_URL" "/tmp/proxy-vars.sh"
-
-      # Rendre les scripts exécutables
+      curl -s -f -L -o /tmp/configure-proxy.sh "https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/configure-proxy.sh?$SAS_TOKEN"
+      curl -s -f -L -o /tmp/proxy-vars.sh "https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/proxy-vars-$VM_NAME.sh?$SAS_TOKEN"
       chmod +x /tmp/configure-proxy.sh /tmp/proxy-vars.sh
 
 package_update: true
 package_upgrade: true
+
 packages:
   - squid
   - apache2-utils
@@ -601,6 +620,87 @@ runcmd:
   - source /tmp/proxy-vars.sh
   - bash /tmp/configure-proxy.sh
 EOF
+
+# Créer les nouvelles machines et ajouter leurs configurations
+for ((i=0; i<MACHINE_COUNT; i++)); do
+    PROXY_PORT=$((PROXY_PORT_BASE + i))
+    VM_NAME="proxy-vm-$PROXY_PORT"
+    
+    # Vérifier si la VM existe déjà
+    if ! az vm show --resource-group "$RESOURCE_GROUP" --name "$VM_NAME" &>/dev/null; then
+        echo "Création de la nouvelle VM $VM_NAME..."
+        # Créer nouvelle VM et configurer
+
+        cat <<EOF > proxy-vars-$VM_NAME.sh
+VM_NAME="$VM_NAME"
+PROXY_PORT="$PROXY_PORT"
+PROXY_USERNAME="$PROXY_USERNAME"
+PROXY_PASSWORD="$PROXY_PASSWORD"
+EOF
+
+        # Upload vers le blob storage
+        az storage blob upload \
+            --account-name "$STORAGE_ACCOUNT" \
+            --account-key "$STORAGE_KEY" \
+            --container-name "$CONTAINER_NAME" \
+            --name "proxy-vars-$VM_NAME.sh" \
+            --file "proxy-vars-$VM_NAME.sh" \
+            --overwrite
+
+        # Créer le cloud-init
+        cat > "cloud-init-$VM_NAME.yaml" << EOF
+#cloud-config
+write_files:
+  - path: /tmp/setup.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      echo "Début du setup"
+      wget -O /tmp/configure-proxy.sh "https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/configure-proxy.sh?$SAS_TOKEN"
+      wget -O /tmp/proxy-vars.sh "https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/proxy-vars-$VM_NAME.sh?$SAS_TOKEN"
+      chmod +x /tmp/configure-proxy.sh /tmp/proxy-vars.sh
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - squid
+  - apache2-utils
+  - wget
+  - curl
+  - net-tools
+
+runcmd:
+  - "bash /tmp/setup.sh"
+  - "source /tmp/proxy-vars.sh"
+  - "bash /tmp/configure-proxy.sh"
+EOF
+        
+        # Créer la VM
+        az vm create \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$VM_NAME" \
+            --image "$IMAGE" \
+            --size "$VM_SIZE" \
+            --custom-data "@cloud-init-$VM_NAME.yaml" \
+            --admin-username "$PROXY_USERNAME" \
+            --admin-password "$PROXY_PASSWORD" \
+            --only-show-errors
+                
+        PROXY_IP=$(az vm show --resource-group "$RESOURCE_GROUP" --name "$VM_NAME" --show-details --query publicIps --output tsv)
+        
+        if [ -n "$PROXY_IP" ]; then
+            HAPROXY_FRONTENDS="${HAPROXY_FRONTENDS}${PROXY_IP} ${PROXY_PORT}\n"
+            HAPROXY_BACKENDS="${HAPROXY_BACKENDS}${VM_NAME} ${PROXY_IP}:3128\n"
+        fi
+        
+        create_proxy_nsg "$VM_NAME"
+    fi
+done
+
+update_haproxy_configuration
+
+
 
 # Générer un SAS Token valide pour le fichier de configuration du haproxy
 SAS_TOKEN_HAPROXY=$(az storage container generate-sas \

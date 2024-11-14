@@ -144,7 +144,134 @@ manage_vm_power() {
     fi
 }
 
-# Fonction pour supprimer une ou plusieurs VMs
+# Fonction pour supprimer tous les éléments associés à une VM
+delete_vm_resources() {
+    local vm_name=$1
+    info_msg "Suppression de tous les éléments associés à $vm_name..."
+    
+    # Obtenir l'ID de la VM
+    local vm_id=$(az vm show --resource-group "$RESOURCE_GROUP" --name "$vm_name" --query "id" -o tsv 2>/dev/null)
+    if [ -z "$vm_id" ]; then
+        error_msg "VM $vm_name non trouvée"
+        return 1
+    fi
+    
+    # Récupérer les informations des ressources
+    local os_disk=$(az vm show --resource-group "$RESOURCE_GROUP" --name "$vm_name" --query "storageProfile.osDisk.name" -o tsv)
+    local data_disks=$(az vm show --resource-group "$RESOURCE_GROUP" --name "$vm_name" --query "storageProfile.dataDisks[].name" -o tsv)
+    local nic_name="${vm_name}VMNic"
+
+    # Récupérer les informations du NSG
+    local nsg_variations=("${vm_name}-nsg" "${vm_name}NSG" "${vm_name}-NSG" "${vm_name}nsg")
+    local nsg_name=""
+    
+    # Trouver le bon nom du NSG
+    for variation in "${nsg_variations[@]}"; do
+        if az network nsg show --resource-group "$RESOURCE_GROUP" --name "$variation" &>/dev/null; then
+            nsg_name="$variation"
+            break
+        fi
+    done
+
+    local public_ip_name="${vm_name}PublicIP"
+
+    # 1. Vérifier et récupérer les informations de l'interface réseau
+    if az network nic show --resource-group "$RESOURCE_GROUP" --name "$nic_name" &>/dev/null; then
+        # Vérifier si un NSG est attaché
+        local attached_nsg=$(az network nic show \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$nic_name" \
+            --query "networkSecurityGroup.id" -o tsv)
+        
+        if [ -n "$attached_nsg" ]; then
+            info_msg "Dissociation du NSG de l'interface réseau..."
+            az network nic update \
+                --resource-group "$RESOURCE_GROUP" \
+                --name "$nic_name" \
+                --network-security-group "" \
+                --no-wait
+            
+            sleep 5
+        fi
+
+        # Vérifier si une IP publique est attachée
+        local has_public_ip=$(az network nic show \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$nic_name" \
+            --query "ipConfigurations[0].publicIpAddress.id" -o tsv)
+        
+        if [ -n "$has_public_ip" ]; then
+            info_msg "Dissociation de l'IP publique de l'interface réseau..."
+            az network nic ip-config update \
+                --resource-group "$RESOURCE_GROUP" \
+                --name "ipconfig${vm_name}" \
+                --nic-name "$nic_name" \
+                --remove publicIpAddress \
+                --no-wait
+            
+            sleep 5
+        fi
+    fi
+
+    # 2. Supprimer la VM
+    info_msg "Suppression de la VM $vm_name..."
+    if az vm show --resource-group "$RESOURCE_GROUP" --name "$vm_name" &>/dev/null; then
+        az vm delete \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$vm_name" \
+            --yes \
+            --force-deletion true \
+            --no-wait
+        
+        sleep 10
+    fi
+
+    # 3. Supprimer l'interface réseau
+    if az network nic show --resource-group "$RESOURCE_GROUP" --name "$nic_name" &>/dev/null; then
+        info_msg "Suppression de l'interface réseau $nic_name..."
+        az network nic delete \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$nic_name" \
+            --no-wait
+        
+        sleep 5
+    fi
+
+    # 4. Supprimer le NSG si trouvé
+    if [ -n "$nsg_name" ]; then
+        info_msg "Suppression du NSG $nsg_name..."
+        az network nsg delete \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$nsg_name" \
+            --no-wait
+        
+        sleep 5
+    fi
+
+    # 5. Supprimer l'IP publique
+    if az network public-ip show --resource-group "$RESOURCE_GROUP" --name "$public_ip_name" &>/dev/null; then
+        info_msg "Suppression de l'IP publique $public_ip_name..."
+        az network public-ip delete \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$public_ip_name" \
+            --no-wait
+    fi
+    
+    # 6. Supprimer les disques
+    if [ -n "$os_disk" ]; then
+        info_msg "Suppression du disque OS $os_disk..."
+        az disk delete --resource-group "$RESOURCE_GROUP" --name "$os_disk" --yes --no-wait
+    fi
+    
+    for data_disk in $data_disks; do
+        info_msg "Suppression du disque de données $data_disk..."
+        az disk delete --resource-group "$RESOURCE_GROUP" --name "$data_disk" --yes --no-wait
+    done
+    
+    success_msg "Suppression des ressources de $vm_name lancée"
+}
+
+# Fonction modifiée pour supprimer une ou plusieurs VMs
 delete_vms() {
     local selection=$1
     
@@ -156,29 +283,18 @@ delete_vms() {
         fi
         
         for vm in $vm_names; do
-            info_msg "Suppression de la VM $vm..."
-            if az vm delete --resource-group "$RESOURCE_GROUP" --name "$vm" --yes --no-wait; then
-                success_msg "Suppression de $vm lancée"
-            else
-                error_msg "Échec de la suppression de $vm"
-            fi
+            delete_vm_resources "$vm"
         done
     else
-        info_msg "ATTENTION: Vous allez supprimer toutes les VMs!"
+        info_msg "ATTENTION: Vous allez supprimer toutes les VMs et leurs ressources associées!"
         read -p "Êtes-vous sûr? (oui/non): " confirm
         if [ "$confirm" = "oui" ]; then
             for vm in "${VM_NAMES[@]}"; do
-                info_msg "- Suppression VM: $vm"
-                if az vm delete --resource-group "$RESOURCE_GROUP" --name "$vm" --yes --no-wait; then
-                    success_msg "Suppression de $vm lancée"
-                else
-                    error_msg "Échec de la suppression de $vm"
-                fi
+                delete_vm_resources "$vm"
             done
         fi
     fi
 }
-
 # Menu principal
 main() {
     # Vérifications initiales
