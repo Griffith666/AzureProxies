@@ -155,20 +155,43 @@ delete_vm_resources() {
         error_msg "VM $vm_name non trouvée"
         return 1
     fi
-    
+
     # Récupérer les informations des ressources
     local os_disk=$(az vm show --resource-group "$RESOURCE_GROUP" --name "$vm_name" --query "storageProfile.osDisk.name" -o tsv)
     local data_disks=$(az vm show --resource-group "$RESOURCE_GROUP" --name "$vm_name" --query "storageProfile.dataDisks[].name" -o tsv)
-    local nic_name="${vm_name}VMNic"
+
+    # Variations possibles pour le nom de l'interface réseau
+    local nic_variations=("${vm_name}VMNic" "${vm_name}VNic" "${vm_name}-nic" "${vm_name}VNET" "${vm_name}VMNic0")
+    local nic_name=""
+
+    # Trouver le bon nom de l'interface réseau
+    for variation in "${nic_variations[@]}"; do
+        if az network nic show --resource-group "$RESOURCE_GROUP" --name "$variation" &>/dev/null; then
+            nic_name="$variation"
+            info_msg "Interface réseau trouvée : $nic_name"
+            break
+        fi
+    done
+
+    # Si aucune interface réseau n'est trouvée, essayer de la trouver via la VM
+    if [ -z "$nic_name" ]; then
+        local nic_id=$(az vm show --resource-group "$RESOURCE_GROUP" --name "$vm_name" \
+            --query "networkProfile.networkInterfaces[0].id" -o tsv)
+        if [ -n "$nic_id" ]; then
+            nic_name=$(basename "$nic_id")
+            info_msg "Interface réseau trouvée via VM : $nic_name"
+        fi
+    fi
 
     # Récupérer les informations du NSG
-    local nsg_variations=("${vm_name}-nsg" "${vm_name}NSG" "${vm_name}-NSG" "${vm_name}nsg")
+    local nsg_variations=("${vm_name}-nsg" "${vm_name}NSG" "${vm_name}-NSG" "${vm_name}nsg" "${vm_name}NSG")
     local nsg_name=""
     
     # Trouver le bon nom du NSG
     for variation in "${nsg_variations[@]}"; do
         if az network nsg show --resource-group "$RESOURCE_GROUP" --name "$variation" &>/dev/null; then
             nsg_name="$variation"
+            info_msg "NSG trouvé : $nsg_name"
             break
         fi
     done
@@ -176,7 +199,7 @@ delete_vm_resources() {
     local public_ip_name="${vm_name}PublicIP"
 
     # 1. Vérifier et récupérer les informations de l'interface réseau
-    if az network nic show --resource-group "$RESOURCE_GROUP" --name "$nic_name" &>/dev/null; then
+    if [ -n "$nic_name" ] && az network nic show --resource-group "$RESOURCE_GROUP" --name "$nic_name" &>/dev/null; then
         # Vérifier si un NSG est attaché
         local attached_nsg=$(az network nic show \
             --resource-group "$RESOURCE_GROUP" \
@@ -194,17 +217,23 @@ delete_vm_resources() {
             sleep 5
         fi
 
+        # Récupérer le nom de la configuration IP
+        local ip_config_name=$(az network nic show \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$nic_name" \
+            --query "ipConfigurations[0].name" -o tsv)
+
         # Vérifier si une IP publique est attachée
         local has_public_ip=$(az network nic show \
             --resource-group "$RESOURCE_GROUP" \
             --name "$nic_name" \
             --query "ipConfigurations[0].publicIpAddress.id" -o tsv)
         
-        if [ -n "$has_public_ip" ]; then
+        if [ -n "$has_public_ip" ] && [ -n "$ip_config_name" ]; then
             info_msg "Dissociation de l'IP publique de l'interface réseau..."
             az network nic ip-config update \
                 --resource-group "$RESOURCE_GROUP" \
-                --name "ipconfig${vm_name}" \
+                --name "$ip_config_name" \
                 --nic-name "$nic_name" \
                 --remove publicIpAddress \
                 --no-wait

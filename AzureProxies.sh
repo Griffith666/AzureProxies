@@ -621,6 +621,41 @@ runcmd:
   - bash /tmp/configure-proxy.sh
 EOF
 
+create_cloud_init() {
+    local VM_NAME=$1
+    cat > "cloud-init-$VM_NAME.yaml" << 'EOF'
+#cloud-config
+write_files:
+  - path: /tmp/download_scripts.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      curl -s -f -L -o /tmp/configure-proxy.sh "$SCRIPT_URL"
+      curl -s -f -L -o /tmp/proxy-vars.sh "$VARS_URL"
+      chmod +x /tmp/configure-proxy.sh /tmp/proxy-vars.sh
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - squid
+  - apache2-utils
+  - curl
+  - net-tools
+
+runcmd:
+  - export SCRIPT_URL="$SCRIPT_URL"
+  - export VARS_URL="$VARS_URL"
+  - bash /tmp/download_scripts.sh
+  - source /tmp/proxy-vars.sh
+  - bash /tmp/configure-proxy.sh
+EOF
+
+    # Replace variables in the cloud-init file
+    sed -i "s|\$SCRIPT_URL|https://${STORAGE_ACCOUNT}.blob.core.windows.net/${CONTAINER_NAME}/configure-proxy.sh?${SAS_TOKEN}|g" "cloud-init-$VM_NAME.yaml"
+    sed -i "s|\$VARS_URL|https://${STORAGE_ACCOUNT}.blob.core.windows.net/${CONTAINER_NAME}/proxy-vars-${VM_NAME}.sh?${SAS_TOKEN}|g" "cloud-init-$VM_NAME.yaml"
+}
+
 # Créer les nouvelles machines et ajouter leurs configurations
 for ((i=0; i<MACHINE_COUNT; i++)); do
     PROXY_PORT=$((PROXY_PORT_BASE + i))
@@ -646,36 +681,10 @@ EOF
             --name "proxy-vars-$VM_NAME.sh" \
             --file "proxy-vars-$VM_NAME.sh" \
             --overwrite
+            
+        # Créer le fichier cloud-init pour la VM
+        create_cloud_init "$VM_NAME"
 
-        # Créer le cloud-init
-        cat > "cloud-init-$VM_NAME.yaml" << EOF
-#cloud-config
-write_files:
-  - path: /tmp/setup.sh
-    permissions: '0755'
-    content: |
-      #!/bin/bash
-      echo "Début du setup"
-      wget -O /tmp/configure-proxy.sh "https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/configure-proxy.sh?$SAS_TOKEN"
-      wget -O /tmp/proxy-vars.sh "https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/proxy-vars-$VM_NAME.sh?$SAS_TOKEN"
-      chmod +x /tmp/configure-proxy.sh /tmp/proxy-vars.sh
-
-package_update: true
-package_upgrade: true
-
-packages:
-  - squid
-  - apache2-utils
-  - wget
-  - curl
-  - net-tools
-
-runcmd:
-  - "bash /tmp/setup.sh"
-  - "source /tmp/proxy-vars.sh"
-  - "bash /tmp/configure-proxy.sh"
-EOF
-        
         # Créer la VM
         az vm create \
             --resource-group "$RESOURCE_GROUP" \
