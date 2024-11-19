@@ -149,7 +149,65 @@ for dir in "/var/log/squid" "/var/spool/squid"; do
     fi
 done
 
-[... reste de votre script de configuration Squid ...]
+cat > /etc/squid/squid.conf <<EOL
+# Ports d'écoute
+http_port 3128
+
+# ACLs de base
+acl SSL_ports port 443
+acl Safe_ports port 80          # http
+acl Safe_ports port 21          # ftp
+acl Safe_ports port 443         # https
+acl Safe_ports port 70          # gopher
+acl Safe_ports port 210         # wais
+acl Safe_ports port 1025-65535  # unregistered ports
+acl Safe_ports port 280         # http-mgmt
+acl Safe_ports port 488         # gss-http
+acl Safe_ports port 591         # filemaker
+acl Safe_ports port 777         # multiling http
+acl CONNECT method CONNECT      # Important: définir l'ACL CONNECT avant de l'utiliser
+
+# Règles d'accès de base
+http_access deny !Safe_ports
+http_access deny CONNECT !SSL_ports
+
+# Configuration de l'authentification
+auth_param basic program /usr/lib/squid/basic_ncsa_auth /etc/squid/passwd
+auth_param basic realm Proxy Authentication Required
+auth_param basic credentialsttl 2 hours
+acl authenticated proxy_auth REQUIRED
+
+# Règles d'accès
+http_access allow authenticated
+http_access deny all
+
+# Configuration du cache
+cache_mem 256 MB
+maximum_object_size 100 MB
+cache_dir ufs /var/spool/squid 1000 16 256
+
+# Optimisation
+forwarded_for off
+via off
+
+# DNS
+dns_nameservers 8.8.8.8 8.8.4.4
+
+# Logs
+access_log /var/log/squid/access.log
+cache_log /var/log/squid/cache.log
+EOL
+
+touch /etc/squid/passwd
+chown proxy:proxy /etc/squid/passwd
+chmod 640 /etc/squid/passwd
+
+htpasswd -b -c /etc/squid/passwd $PROXY_USERNAME $PROXY_PASSWORD
+
+chown -R proxy:proxy /var/log/squid
+chown -R proxy:proxy /var/spool/squid
+
+squid -z
 
 # Vérification finale plus détaillée
 log "Vérification finale de la configuration..."
@@ -595,65 +653,42 @@ EOF
   # Charger le fichier de variables dans le stockage Azure
     az storage blob upload --account-name "$STORAGE_ACCOUNT" --account-key "$STORAGE_KEY" --container-name "$CONTAINER_NAME" --name "proxy-vars-$VM_NAME.sh" --file "proxy-vars-$VM_NAME.sh" --auth-mode login --overwrite
 
-    # Générer le cloud-init pour chaque VM proxy
-cat <<EOF > "cloud-init-$VM_NAME.yaml"
-#cloud-config
-write_files:
-  - path: /tmp/download_scripts.sh
-    permissions: '0755'
-    content: |
-      #!/bin/bash
-      curl -s -f -L -o /tmp/configure-proxy.sh "https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/configure-proxy.sh?$SAS_TOKEN"
-      curl -s -f -L -o /tmp/proxy-vars.sh "https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/proxy-vars-$VM_NAME.sh?$SAS_TOKEN"
-      chmod +x /tmp/configure-proxy.sh /tmp/proxy-vars.sh
-
-package_update: true
-package_upgrade: true
-
-packages:
-  - squid
-  - apache2-utils
-  - curl
-
-runcmd:
-  - bash /tmp/download_scripts.sh
-  - source /tmp/proxy-vars.sh
-  - bash /tmp/configure-proxy.sh
-EOF
-
 create_cloud_init() {
     local VM_NAME=$1
-    cat > "cloud-init-$VM_NAME.yaml" << 'EOF'
+    cat > "cloud-init-$VM_NAME.yaml" << 'EOYAML'
 #cloud-config
-write_files:
-  - path: /tmp/download_scripts.sh
-    permissions: '0755'
-    content: |
-      #!/bin/bash
-      curl -s -f -L -o /tmp/configure-proxy.sh "$SCRIPT_URL"
-      curl -s -f -L -o /tmp/proxy-vars.sh "$VARS_URL"
-      chmod +x /tmp/configure-proxy.sh /tmp/proxy-vars.sh
-
 package_update: true
 package_upgrade: true
 
 packages:
-  - squid
-  - apache2-utils
-  - curl
-  - net-tools
+ - squid
+ - apache2-utils
+ - curl
+ - net-tools
+
+write_files:
+ - path: /tmp/install_proxy.sh
+   permissions: '0755'
+   encoding: b64
+   content: |
+     IyEvYmluL2Jhc2gKZWNobyAiRGVtYXJyYWdlIGRlIGwnaW5zdGFsbGF0aW9uLi4uIgpjdXJs
+     IC1zIC1mIC1MIC1vIC90bXAvY29uZmlndXJlLXByb3h5LnNoICIke1NDUklQVF9VUkx9Igpj
+     dXJsIC1zIC1mIC1MIC1vIC90bXAvcHJveHktdmFycy5zaCAiJHtWQVJTX1VSTH0iCmNobW9k
+     ICt4IC90bXAvY29uZmlndXJlLXByb3h5LnNoIC90bXAvcHJveHktdmFycy5zaAo=
 
 runcmd:
-  - export SCRIPT_URL="$SCRIPT_URL"
-  - export VARS_URL="$VARS_URL"
-  - bash /tmp/download_scripts.sh
-  - source /tmp/proxy-vars.sh
-  - bash /tmp/configure-proxy.sh
-EOF
+ - export SCRIPT_URL="https://${STORAGE_ACCOUNT}.blob.core.windows.net/${CONTAINER_NAME}/configure-proxy.sh?${SAS_TOKEN}"
+ - export VARS_URL="https://${STORAGE_ACCOUNT}.blob.core.windows.net/${CONTAINER_NAME}/proxy-vars-${VM_NAME}.sh?${SAS_TOKEN}"
+ - bash /tmp/install_proxy.sh
+ - source /tmp/proxy-vars.sh
+ - bash /tmp/configure-proxy.sh
+EOYAML
 
-    # Replace variables in the cloud-init file
-    sed -i "s|\$SCRIPT_URL|https://${STORAGE_ACCOUNT}.blob.core.windows.net/${CONTAINER_NAME}/configure-proxy.sh?${SAS_TOKEN}|g" "cloud-init-$VM_NAME.yaml"
-    sed -i "s|\$VARS_URL|https://${STORAGE_ACCOUNT}.blob.core.windows.net/${CONTAINER_NAME}/proxy-vars-${VM_NAME}.sh?${SAS_TOKEN}|g" "cloud-init-$VM_NAME.yaml"
+    # Remplacer les variables dans le fichier
+    sed -i "s|\${STORAGE_ACCOUNT}|$STORAGE_ACCOUNT|g" "cloud-init-$VM_NAME.yaml"
+    sed -i "s|\${CONTAINER_NAME}|$CONTAINER_NAME|g" "cloud-init-$VM_NAME.yaml"
+    sed -i "s|\${SAS_TOKEN}|$SAS_TOKEN|g" "cloud-init-$VM_NAME.yaml"
+    sed -i "s|\${VM_NAME}|$VM_NAME|g" "cloud-init-$VM_NAME.yaml"
 }
 
 # Créer les nouvelles machines et ajouter leurs configurations
