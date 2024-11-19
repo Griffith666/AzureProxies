@@ -563,86 +563,6 @@ for VM in $EXISTING_VMS; do
     fi
 done
 
-
-create_cloud_init() {
-    local VM_NAME=$1
-    local YAML_CONTENT=$(cat <<EOF
-#cloud-config
-write_files:
-  - path: /tmp/download_scripts.sh
-    permissions: '0755'
-    content: |
-      #!/bin/bash
-      exec 1> >(logger -s -t $(basename \$0)) 2>&1
-      
-      log() {
-          echo "[\$(date '+%Y-%m-%d %H:%M:%S')] \$1"
-          logger -t squid-setup "\$1"
-      }
-      
-      download_with_retry() {
-          local url=\$1
-          local output=\$2
-          local max_attempts=5
-          local attempt=1
-          
-          while [ \$attempt -le \$max_attempts ]; do
-              log "Tentative \$attempt de téléchargement de \$output"
-              if curl -s -f -L -o "\$output" "\$url"; then
-                  log "Téléchargement réussi de \$output"
-                  return 0
-              else
-                  log "Échec du téléchargement (tentative \$attempt)"
-                  sleep 10
-                  attempt=\$((attempt + 1))
-              fi
-          done
-          return 1
-      }
-
-      # URLs avec SAS Token
-      SCRIPT_URL="${SCRIPT_URL}"
-      VARS_URL="${VARS_URL}"
-      
-      log "Début du téléchargement des scripts..."
-      download_with_retry "\$SCRIPT_URL" "/tmp/configure-proxy.sh" || exit 1
-      download_with_retry "\$VARS_URL" "/tmp/proxy-vars.sh" || exit 1
-      
-      chmod +x /tmp/configure-proxy.sh /tmp/proxy-vars.sh
-      log "Scripts rendus exécutables"
-
-package_update: true
-package_upgrade: true
-
-packages:
-  - squid
-  - apache2-utils
-  - curl
-  - net-tools
-
-runcmd:
-  - |
-    exec 1> >(logger -s -t cloud-init-runcmd) 2>&1
-    echo "Démarrage de la configuration Squid"
-    
-    # Export des variables
-    export SCRIPT_URL="https://${STORAGE_ACCOUNT}.blob.core.windows.net/${CONTAINER_NAME}/configure-proxy.sh?${SAS_TOKEN}"
-    export VARS_URL="https://${STORAGE_ACCOUNT}.blob.core.windows.net/${CONTAINER_NAME}/proxy-vars-${VM_NAME}.sh?${SAS_TOKEN}"
-    
-    # Exécution des scripts
-    bash /tmp/download_scripts.sh
-    if [ -f /tmp/proxy-vars.sh ] && [ -f /tmp/configure-proxy.sh ]; then
-        source /tmp/proxy-vars.sh
-        bash /tmp/configure-proxy.sh
-    else
-        echo "ERREUR: Scripts de configuration manquants"
-        exit 1
-    fi
-EOF
-)
-    echo "$YAML_CONTENT"
-}
-
     cat <<EOF > proxy-vars-$VM_NAME.sh
 VM_NAME="$VM_NAME"
 PROXY_PORT="$PROXY_PORT"
@@ -655,42 +575,43 @@ EOF
 
 create_cloud_init() {
     local VM_NAME=$1
-    cat > "cloud-init-$VM_NAME.yaml" << 'EOYAML'
+    cat > "cloud-init-$VM_NAME.yaml" <<EOF
 #cloud-config
 package_update: true
 package_upgrade: true
 
 packages:
- - squid
- - apache2-utils
- - curl
- - net-tools
+  - squid
+  - apache2-utils
+  - curl
+  - net-tools
 
 write_files:
- - path: /tmp/install_proxy.sh
-   permissions: '0755'
-   encoding: b64
-   content: |
-     IyEvYmluL2Jhc2gKZWNobyAiRGVtYXJyYWdlIGRlIGwnaW5zdGFsbGF0aW9uLi4uIgpjdXJs
-     IC1zIC1mIC1MIC1vIC90bXAvY29uZmlndXJlLXByb3h5LnNoICIke1NDUklQVF9VUkx9Igpj
-     dXJsIC1zIC1mIC1MIC1vIC90bXAvcHJveHktdmFycy5zaCAiJHtWQVJTX1VSTH0iCmNobW9k
-     ICt4IC90bXAvY29uZmlndXJlLXByb3h5LnNoIC90bXAvcHJveHktdmFycy5zaAo=
+  - path: /tmp/install_proxy.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      echo "Installation des scripts de configuration..."
+      SCRIPT_URL='https://${STORAGE_ACCOUNT}.blob.core.windows.net/${CONTAINER_NAME}/configure-proxy.sh?${SAS_TOKEN}'
+      VARS_URL='https://${STORAGE_ACCOUNT}.blob.core.windows.net/${CONTAINER_NAME}/proxy-vars-${VM_NAME}.sh?${SAS_TOKEN}'
+      
+      curl -s -f -L -o /tmp/configure-proxy.sh "\$SCRIPT_URL"
+      curl -s -f -L -o /tmp/proxy-vars.sh "\$VARS_URL"
+      
+      chmod +x /tmp/configure-proxy.sh /tmp/proxy-vars.sh
 
 runcmd:
- - export SCRIPT_URL="https://${STORAGE_ACCOUNT}.blob.core.windows.net/${CONTAINER_NAME}/configure-proxy.sh?${SAS_TOKEN}"
- - export VARS_URL="https://${STORAGE_ACCOUNT}.blob.core.windows.net/${CONTAINER_NAME}/proxy-vars-${VM_NAME}.sh?${SAS_TOKEN}"
- - bash /tmp/install_proxy.sh
- - source /tmp/proxy-vars.sh
- - bash /tmp/configure-proxy.sh
-EOYAML
+  - bash /tmp/install_proxy.sh
+  - source /tmp/proxy-vars.sh
+  - bash /tmp/configure-proxy.sh
+EOF
 
     # Remplacer les variables dans le fichier
-    sed -i "s|\${STORAGE_ACCOUNT}|$STORAGE_ACCOUNT|g" "cloud-init-$VM_NAME.yaml"
-    sed -i "s|\${CONTAINER_NAME}|$CONTAINER_NAME|g" "cloud-init-$VM_NAME.yaml"
-    sed -i "s|\${SAS_TOKEN}|$SAS_TOKEN|g" "cloud-init-$VM_NAME.yaml"
-    sed -i "s|\${VM_NAME}|$VM_NAME|g" "cloud-init-$VM_NAME.yaml"
+    sed -i "s/\${STORAGE_ACCOUNT}/$STORAGE_ACCOUNT/g" "cloud-init-$VM_NAME.yaml"
+    sed -i "s/\${CONTAINER_NAME}/$CONTAINER_NAME/g" "cloud-init-$VM_NAME.yaml"
+    sed -i "s/\${SAS_TOKEN}/$SAS_TOKEN/g" "cloud-init-$VM_NAME.yaml"
+    sed -i "s/\${VM_NAME}/$VM_NAME/g" "cloud-init-$VM_NAME.yaml"
 }
-
 # Créer les nouvelles machines et ajouter leurs configurations
 for ((i=0; i<MACHINE_COUNT; i++)); do
     PROXY_PORT=$((PROXY_PORT_BASE + i))
