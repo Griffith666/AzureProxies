@@ -149,6 +149,9 @@ for dir in "/var/log/squid" "/var/spool/squid"; do
     fi
 done
 
+mkdir -p /etc/squid/ssl
+openssl req -new -newkey rsa:2048 -days 365 -nodes -x509 -keyout /etc/squid/ssl/squid.pem -out /etc/squid/ssl/squid.pem
+
 cat > /etc/squid/squid.conf <<EOL
 # Ports d'écoute
 http_port 3128
@@ -168,8 +171,20 @@ acl Safe_ports port 777         # multiling http
 acl CONNECT method CONNECT      # Important: définir l'ACL CONNECT avant de l'utiliser
 
 # Règles d'accès de base
+http_access allow CONNECT SSL_ports
 http_access deny !Safe_ports
 http_access deny CONNECT !SSL_ports
+
+# Gestion SSL/HTTPS
+https_port 3129 cert=/etc/squid/ssl/squid.pem
+
+# Autoriser les redirections
+follow_x_forwarded_for allow all
+request_header_access X-Forwarded-For allow all
+
+# Augmenter le timeout pour les redirections
+forwarded_for on
+request_timeout 5 minutes
 
 # Configuration de l'authentification
 auth_param basic program /usr/lib/squid/basic_ncsa_auth /etc/squid/passwd
