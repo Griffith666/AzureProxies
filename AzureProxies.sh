@@ -68,132 +68,423 @@ SCRIPT_URL="https://$STORAGE_ACCOUNT.blob.core.windows.net/$CONTAINER_NAME/confi
 cat <<'EOF' > configure-proxy.sh
 #!/bin/bash
 
-# Configuration du logging
-exec 1> >(logger -s -t $(basename $0)) 2>&1
+# Configuration du logging plus détaillé
+exec 1> >(tee -a /var/log/squid-setup.log) 2>&1
 
-# Fonction de logging améliorée
+# Fonction de logging améliorée avec timestamp et niveau de log
 log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
-    logger -t squid-setup "$1"
+    local level=$1
+    local message=$2
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $message" | tee -a /var/log/squid-setup.log
+    logger -t squid-setup "$level: $message"
 }
 
-# Vérification des variables requises
+# Fonction de vérification des erreurs
+check_error() {
+    local exit_code=$1
+    local step=$2
+    if [ $exit_code -ne 0 ]; then
+        log "ERROR" "Échec à l'étape : $step (code: $exit_code)"
+        log "ERROR" "Contenu de /var/log/squid-setup.log :"
+        tail -n 50 /var/log/squid-setup.log
+        log "ERROR" "Contenu de /var/log/cloud-init-output.log :"
+        tail -n 50 /var/log/cloud-init-output.log
+        exit $exit_code
+    else
+        log "INFO" "Succès de l'étape : $step"
+    fi
+}
+
+# Fonction de vérification du progrès
+check_progress() {
+    local step=$1
+    local logfile=$2
+    local timeout=$3
+    local start_time=$(date +%s)
+
+    while true; do
+        if [ ! -f "$logfile" ]; then
+            log "ERROR" "Fichier de log $logfile non trouvé"
+            return 1
+        fi
+
+        # Détection d'erreurs plus précise
+        if tail -n 50 "$logfile" | grep -q "configure: error\|fatal error\|make.*Error.*\|make.*Failed.*"; then
+            log "ERROR" "Erreur critique détectée dans $step"
+            tail -n 50 "$logfile"
+            return 1
+        fi
+
+        current_time=$(date +%s)
+        elapsed=$((current_time - start_time))
+        if [ $elapsed -gt $timeout ]; then
+            log "ERROR" "$step a dépassé le délai d'attente de $timeout secondes"
+            return 1
+        fi
+
+        # Conditions de succès améliorées
+        case "$step" in
+            "configure")
+                if [ -f Makefile ] && [ -f config.status ]; then
+                    return 0
+                fi
+                ;;
+            "make")
+                if tail -n 50 "$logfile" | grep -q "Making all in test-suite" && \
+                   tail -n 50 "$logfile" | grep -q "Nothing to be done for 'all-am'"; then
+                    return 0
+                fi
+                ;;
+            "install")
+                if [ -f /usr/sbin/squid ]; then
+                    return 0
+                fi
+                ;;
+        esac
+
+        sleep 10
+    done
+}
+
+# Vérification initiale
+log "INFO" "Début de l'installation de Squid"
+log "INFO" "Vérification de l'environnement..."
+
+# Vérification des variables requises avec plus de détails
 check_required_vars() {
     local missing_vars=()
     for var in VM_NAME PROXY_PORT PROXY_USERNAME PROXY_PASSWORD; do
         if [ -z "${!var}" ]; then
             missing_vars+=($var)
+            log "WARNING" "Variable manquante: $var"
+        else
+            log "INFO" "Variable présente: $var"
         fi
     done
     
     if [ ${#missing_vars[@]} -ne 0 ]; then
-        log "ERREUR: Variables manquantes: ${missing_vars[*]}"
+        log "ERROR" "Variables manquantes: ${missing_vars[*]}"
         exit 1
     fi
 }
 
-# Fonction de vérification des installations
-verify_installation() {
-    local package=$1
-    if ! dpkg -l | grep -q "^ii.*$package"; then
-        log "ERREUR: $package n'est pas correctement installé"
-        return 1
-    fi
-    return 0
-}
-
-# Charger les variables de configuration
+# Vérification du fichier de variables
 if [ ! -f /tmp/proxy-vars.sh ]; then
-    log "ERREUR: Fichier de variables non trouvé"
+    log "ERROR" "Fichier de variables non trouvé: /tmp/proxy-vars.sh"
     exit 1
 fi
 
 source /tmp/proxy-vars.sh
 check_required_vars
 
-log "Configuration de Squid pour VM: $VM_NAME"
-log "Port: $PROXY_PORT, Username: $PROXY_USERNAME"
+log "INFO" "Configuration de Squid pour VM: $VM_NAME"
 
-# Installation et vérification des paquets
-log "Vérification des paquets nécessaires..."
-for pkg in squid apache2-utils; do
-    if ! verify_installation $pkg; then
-        log "Installation de $pkg..."
-        apt-get update && apt-get install -y $pkg
-        if ! verify_installation $pkg; then
-            log "ERREUR: Échec de l'installation de $pkg"
-            exit 1
-        fi
-    fi
+# Installation des paquets avec vérification
+log "INFO" "Installation des paquets..."
+apt-get update
+check_error $? "apt-get update"
+
+# Installation des dépendances avec log pour chaque paquet
+PACKAGES=(
+    "build-essential"
+    "openssl"
+    "libssl-dev"
+    "pkg-config"
+    "apache2-utils"
+    "ssl-cert"
+    "libldap2-dev"
+    "libsasl2-dev"
+    "libxml2-dev"
+    "libpcre3-dev"
+    "libkrb5-dev"
+    "nettle-dev"
+    "libnetfilter-conntrack-dev"
+    "libpam0g-dev"
+    "libdb-dev"
+    "libexpat1-dev"
+    "libcdb-dev"
+    "libcap-dev"
+    "libecap3-dev"
+    "libsystemd-dev"
+)
+
+for package in "${PACKAGES[@]}"; do
+    log "INFO" "Installation de $package..."
+    apt-get install -y $package
+    check_error $? "Installation de $package"
 done
 
-# Nettoyage avec vérification
-log "Nettoyage des fichiers Squid existants..."
-systemctl stop squid
-for dir in "/var/run/squid.pid" "/var/spool/squid" "/var/log/squid"; do
-    if [ -e "$dir" ]; then
-        rm -rf "$dir"
-        log "Nettoyage de $dir effectué"
-    fi
+log "INFO" "Configuration du module tproxy..."
+modprobe iptable_mangle
+modprobe nf_tproxy_ipv4
+echo "iptable_mangle" >> /etc/modules
+echo "nf_tproxy_ipv4" >> /etc/modules
+
+# Configuration iptables pour tproxy
+iptables -t mangle -N DIVERT
+iptables -t mangle -A DIVERT -j MARK --set-mark 1
+iptables -t mangle -A DIVERT -j ACCEPT
+iptables -t mangle -A PREROUTING -p tcp -m socket -j DIVERT
+iptables -t mangle -A PREROUTING -p tcp --dport 80 -j TPROXY --tproxy-mark 0x1/0x1 --on-port 3128
+iptables -t mangle -A PREROUTING -p tcp --dport 443 -j TPROXY --tproxy-mark 0x1/0x1 --on-port 3129
+
+# Pré-configuration de iptables-persistent pour éviter l'interaction
+echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections
+echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections
+
+# Installation de iptables-persistent sans interaction
+DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent
+check_error $? "Installation de iptables-persistent"
+
+# Sauvegarde des règles
+netfilter-persistent save
+check_error $? "Sauvegarde des règles iptables"
+
+sysctl -w net.ipv4.ip_nonlocal_bind=1
+echo "net.ipv4.ip_nonlocal_bind=1" >> /etc/sysctl.conf
+
+# Téléchargement et compilation de Squid avec vérification
+log "INFO" "Téléchargement de Squid..."
+cd /tmp
+wget http://www.squid-cache.org/Versions/v5/squid-5.9.tar.gz
+check_error $? "Téléchargement de Squid"
+
+log "INFO" "Extraction de Squid..."
+tar xzf squid-5.9.tar.gz
+check_error $? "Extraction de Squid"
+
+cd squid-5.9
+log "INFO" "Configuration de Squid..."
+make distclean >/dev/null 2>&1 || true
+
+
+export CFLAGS="-pipe -O2"
+export CXXFLAGS="-pipe -O2"
+export LDFLAGS="-Wl,-rpath,/usr/lib"
+
+# Configuration avec log détaillé
+./configure \
+    --prefix=/usr \
+    --localstatedir=/var \
+    --libexecdir=/usr/lib/squid \
+    --datadir=/usr/share/squid \
+    --sysconfdir=/etc/squid \
+    --with-default-user=proxy \
+    --with-logdir=/var/log/squid \
+    --with-pidfile=/var/run/squid.pid \
+    --with-openssl \
+    --enable-ssl-crtd \
+    --enable-linux-netfilter \
+    --with-nat-devpoll \
+    --enable-ssl \
+    --with-large-files \
+    --enable-icmp \
+    --enable-cache-digests \
+    --enable-underscores \
+    --enable-auth-basic="NCSA" \
+    --enable-auth-digest="file" \
+    --enable-auth-negotiate="wrapper" \
+    --enable-auth-ntlm="fake" \
+    --enable-storeio="ufs,aufs,diskd,rock" \
+    --enable-removal-policies="lru,heap" \
+    --enable-delay-pools \
+    --enable-snmp 2>&1 | tee /var/log/squid-configure.log
+
+configure_status=${PIPESTATUS[0]}
+if [ $configure_status -ne 0 ]; then
+    log "ERROR" "La configuration a échoué avec le code $configure_status"
+    tail -n 50 /var/log/squid-configure.log
+    exit 1
+fi
+
+# Vérification explicite du succès de la configuration
+if [ ! -f Makefile ] || [ ! -f config.status ]; then
+    log "ERROR" "Configuration incomplète - fichiers manquants"
+    ls -la
+    exit 1
+fi
+log "INFO" "Configuration terminée avec succès"
+
+log "INFO" "Compilation de Squid..."
+make -j$(nproc) V=1 2>&1 | tee /var/log/squid-make.log
+make_status=${PIPESTATUS[0]}
+if [ $make_status -ne 0 ]; then
+    log "ERROR" "La compilation a échoué avec le code $make_status"
+    tail -n 50 /var/log/squid-make.log
+    exit 1
+fi
+
+# Installation
+log "INFO" "Installation de Squid..."
+make install 2>&1 | tee /var/log/squid-make-install.log
+install_status=${PIPESTATUS[0]}
+if [ $install_status -ne 0 ]; then
+    log "ERROR" "L'installation a échoué avec le code $install_status"
+    tail -n 50 /var/log/squid-make-install.log
+    exit 1
+fi
+
+cp -r src/mime.conf /etc/squid/
+cp -r errors/en/* /usr/share/squid/errors/
+cp -f src/security_file_certgen /usr/lib/squid/
+cp -f lib/basic_ncsa_auth /usr/lib/squid/
+
+chmod 755 /usr/lib/squid/security_file_certgen
+chmod 755 /usr/lib/squid/basic_ncsa_auth
+
+log "INFO" "Installation des fichiers de configuration..."
+mkdir -p /etc/squid
+mkdir -p /usr/share/squid/errors
+mkdir -p /usr/lib/squid
+
+# Création du service systemd
+log "Configuration du service systemd..."
+cat > /etc/systemd/system/squid.service <<EOL
+[Unit]
+Description=Squid caching proxy
+After=network.target
+
+[Service]
+Type=forking
+PIDFile=/run/squid.pid
+ExecStartPre=/usr/sbin/squid -N -z
+ExecStart=/usr/sbin/squid -sYC
+ExecReload=/usr/sbin/squid -k reconfigure
+ExecStop=/usr/sbin/squid -k shutdown
+KillMode=mixed
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOL
+
+# Créer l'utilisateur proxy s'il n'existe pas
+id -u proxy &>/dev/null || useradd -r -s /usr/sbin/nologin proxy
+
+# Création des répértoires de cache
+mkdir -p /var/log/squid /var/spool/squid /var/cache/squid
+chown -R proxy:proxy /var/log/squid /var/spool/squid /var/cache/squid
+chmod 750 /var/log/squid /var/spool/squid /var/cache/squid
+
+log "INFO" "Création de la structure des répertoires..."
+for dir in \
+    "/etc/squid" \
+    "/var/log/squid" \
+    "/var/spool/squid" \
+    "/var/cache/squid" \
+    "/var/lib/squid/ssl_db" \
+    "/usr/lib/squid" \
+    "/usr/share/squid/errors"
+do
+    mkdir -p $dir
+    chown proxy:proxy $dir
+    chmod 750 $dir
 done
 
-# Création des répertoires avec vérification
-log "Création des répertoires..."
-for dir in "/var/log/squid" "/var/spool/squid"; do
-    mkdir -p "$dir"
-    chown -R proxy:proxy "$dir"
-    chmod -R 755 "$dir"
-    if [ ! -d "$dir" ]; then
-        log "ERREUR: Impossible de créer $dir"
+# Configuration SSL
+log "Configuration SSL..."
+mkdir -p /etc/squid/ssl
+cd /etc/squid/ssl
+
+# Génération des certificats
+openssl req -new -newkey rsa:2048 -sha256 -days 3650 -nodes -x509 \
+    -extensions v3_ca \
+    -keyout squid-ca-key.pem \
+    -out squid-ca-cert.pem \
+    -subj "/C=FR/ST=Paris/L=Paris/O=ProxyAuth CA/CN=Proxy CA"
+
+openssl req -new -newkey rsa:2048 -sha256 -days 3650 -nodes \
+    -keyout squid.key \
+    -out squid.csr \
+    -subj "/C=FR/ST=Paris/L=Paris/O=ProxyAuth/CN=$VM_NAME"
+
+openssl x509 -req -days 3650 -in squid.csr \
+    -CA squid-ca-cert.pem \
+    -CAkey squid-ca-key.pem \
+    -CAcreateserial \
+    -out squid.crt
+
+cat squid.key squid.crt > squid.pem
+
+chmod 400 squid*.pem squid.key
+chown proxy:proxy squid*.pem squid.key
+
+log "INFO" "Vérification des composants essentiels..."
+REQUIRED_FILES=(
+    "/usr/sbin/squid"
+    "/usr/lib/squid/security_file_certgen"
+    "/usr/lib/squid/basic_ncsa_auth"
+    "/etc/squid/mime.conf"
+)
+
+for file in "${REQUIRED_FILES[@]}"; do
+    if [ ! -f "$file" ]; then
+        log "ERROR" "Fichier requis manquant : $file"
         exit 1
     fi
 done
 
-mkdir -p /etc/squid/ssl
-openssl req -new -newkey rsa:2048 -days 365 -nodes -x509 -keyout /etc/squid/ssl/squid.pem -out /etc/squid/ssl/squid.pem
+log "INFO" "Installation des fichiers de configuration..."
+mkdir -p /usr/share/squid/icons
+mkdir -p /usr/share/squid/errors
 
+cp -r icons/* /usr/share/squid/icons/ || log "WARNING" "Pas d'icônes trouvées"
+cp -r errors/en/* /usr/share/squid/errors/
+cp src/mime.conf /etc/squid/
+
+chown -R proxy:proxy /usr/share/squid
+chown -R proxy:proxy /etc/squid
+chmod 750 /usr/share/squid
+chmod 750 /etc/squid
+chmod 640 /etc/squid/mime.conf
+chmod 640 /etc/squid/squid.conf
+
+for dir in "/var/log/squid" "/var/cache/squid" "/var/run"; do
+    mkdir -p $dir
+    chown proxy:proxy $dir
+    chmod 750 $dir
+done
+
+# Configuration Squid
+log "Création de la configuration Squid..."
 cat > /etc/squid/squid.conf <<EOL
 # Ports d'écoute
-http_port 3128
+http_port 3128 tproxy
+https_port 3129 tproxy ssl-bump cert=/etc/squid/ssl/squid.pem generate-host-certificates=on dynamic_cert_mem_cache_size=4MB tls-v1.2
 
 # ACLs de base
+acl localnet src 0.0.0.0/0
+
+# Ports SSL/TLS standard
 acl SSL_ports port 443
 acl Safe_ports port 80          # http
 acl Safe_ports port 21          # ftp
 acl Safe_ports port 443         # https
-acl Safe_ports port 70          # gopher
-acl Safe_ports port 210         # wais
 acl Safe_ports port 1025-65535  # unregistered ports
-acl Safe_ports port 280         # http-mgmt
-acl Safe_ports port 488         # gss-http
-acl Safe_ports port 591         # filemaker
-acl Safe_ports port 777         # multiling http
-acl CONNECT method CONNECT      # Important: définir l'ACL CONNECT avant de l'utiliser
+acl CONNECT method CONNECT
 
-# Règles d'accès de base
-http_access allow CONNECT SSL_ports
-http_access deny !Safe_ports
-http_access deny CONNECT !SSL_ports
+# SSL Bump Configuration
+ssl_bump server-first all
+sslcrtd_program /usr/lib/squid/security_file_certgen -s /var/lib/squid/ssl_db -M 4MB
+sslcrtd_children 5
 
-# Gestion SSL/HTTPS
-https_port 3129 cert=/etc/squid/ssl/squid.pem
+# Configuration TLS
+tls_outgoing_options options=NO_SSLv3 cipher=HIGH:MEDIUM:!RC4:!aNULL:!eNULL:!LOW:!3DES:!MD5:!EXP:!PSK:!SRP:!DSS
 
-# Autoriser les redirections
-follow_x_forwarded_for allow all
-request_header_access X-Forwarded-For allow all
-
-# Augmenter le timeout pour les redirections
-forwarded_for on
-request_timeout 5 minutes
-
-# Configuration de l'authentification
+# ACLs pour l'authentification
 auth_param basic program /usr/lib/squid/basic_ncsa_auth /etc/squid/passwd
-auth_param basic realm Proxy Authentication Required
+auth_param basic realm Proxy Authentication
 auth_param basic credentialsttl 2 hours
 acl authenticated proxy_auth REQUIRED
 
 # Règles d'accès
+http_access allow localhost manager
+http_access deny manager
+http_access allow localhost
 http_access allow authenticated
+http_access deny !Safe_ports
+http_access deny CONNECT !SSL_ports
 http_access deny all
 
 # Configuration du cache
@@ -201,51 +492,120 @@ cache_mem 256 MB
 maximum_object_size 100 MB
 cache_dir ufs /var/spool/squid 1000 16 256
 
-# Optimisation
-forwarded_for off
-via off
-
-# DNS
-dns_nameservers 8.8.8.8 8.8.4.4
-
 # Logs
-access_log /var/log/squid/access.log
+debug_options ALL,1
+access_log daemon:/var/log/squid/access.log combined
 cache_log /var/log/squid/cache.log
+
+# Configuration supplémentaire
+via off
+forwarded_for delete
+request_header_access X-Forwarded-For deny all
+request_header_access Via deny all
+request_header_access Cache-Control deny all
 EOL
 
+log "INFO" "Vérification des permissions des fichiers..."
+if [ ! -f /etc/squid/squid.conf ]; then
+    log "ERROR" "Le fichier de configuration n'existe pas"
+    exit 1
+fi
+
+# Configuration de l'authentification
+log "Configuration de l'authentification..."
 touch /etc/squid/passwd
 chown proxy:proxy /etc/squid/passwd
 chmod 640 /etc/squid/passwd
-
 htpasswd -b -c /etc/squid/passwd $PROXY_USERNAME $PROXY_PASSWORD
 
+# Permissions des répertoires
+log "Configuration des permissions..."
+mkdir -p /var/log/squid /var/spool/squid
 chown -R proxy:proxy /var/log/squid
 chown -R proxy:proxy /var/spool/squid
+chown -R proxy:proxy /etc/squid/squid.conf
+chmod 640 /etc/squid/squid.conf
+chmod 750 /var/log/squid
+chmod 750 /var/spool/squid
 
+log "Initialisation de la base SSL..."
+log "INFO" "Préparation de la base SSL..."
+rm -rf /var/lib/squid/ssl_db
+mkdir -p /var/lib/squid/ssl_db
+chown -R proxy:proxy /var/lib/squid
+chmod 750 /var/lib/squid
+chmod 750 /var/lib/squid/ssl_db
+
+log "INFO" "Initialisation SSL..."
+if [ ! -f /usr/lib/squid/security_file_certgen ]; then
+    log "ERROR" "security_file_certgen manquant"
+    exit 1
+fi
+
+su -s /bin/bash proxy -c "/usr/lib/squid/security_file_certgen -c -s /var/lib/squid/ssl_db -M 4MB"
+check_error $? "Initialisation SSL"
+
+# Initialisation du cache
+log "Initialisation du cache..."
 squid -z
 
-# Vérification finale plus détaillée
-log "Vérification finale de la configuration..."
-if ! squid -k parse; then
-    log "ERREUR: La configuration de Squid contient des erreurs"
+log "INFO" "Vérification de l'installation..."
+if [ ! -f /usr/sbin/squid ]; then
+    log "ERROR" "Le binaire squid n'est pas présent après l'installation"
     exit 1
 fi
 
-if ! systemctl restart squid; then
-    log "ERREUR: Impossible de redémarrer Squid"
-    journalctl -u squid --no-pager | tail -n 50
-    exit 1
-fi
+log "INFO" "Vérification finale des permissions..."
+required_dirs=(
+    "/etc/squid"
+    "/var/log/squid"
+    "/var/cache/squid"
+    "/var/run"
+    "/usr/share/squid"
+    "/usr/share/squid/errors"
+    "/usr/share/squid/icons"
+    "/var/lib/squid/ssl_db"
+)
+
+for dir in "${required_dirs[@]}"; do
+    if [ ! -d "$dir" ]; then
+        mkdir -p "$dir"
+    fi
+    chown -R proxy:proxy "$dir"
+    chmod 750 "$dir"
+done
+
+# Démarrage de Squid
+log "Démarrage de Squid..."
+systemctl daemon-reload
+systemctl enable squid
+systemctl start squid
+sleep 5
 
 if ! systemctl is-active --quiet squid; then
     log "ERREUR: Squid n'est pas actif après le redémarrage"
     systemctl status squid
+    journalctl -xe --no-pager | tail -n 50
     exit 1
 fi
 
-# Vérification du port d'écoute
-if ! netstat -tulpn | grep :3128; then
-    log "ERREUR: Squid n'écoute pas sur le port 3128"
+# Vérifier la version installée
+squid_version=$(/usr/sbin/squid -v | head -n1)
+log "INFO" "Version de Squid installée: $squid_version"
+
+log "INFO" "Validation finale..."
+if ! pgrep -x "squid" > /dev/null; then
+    log "ERROR" "Processus squid non trouvé"
+    exit 1
+fi
+
+if ! netstat -tulpn | grep -q ":3128"; then
+    log "ERROR" "Port 3128 non ouvert"
+    exit 1
+fi
+
+if ! netstat -tulpn | grep -q ":3129"; then
+    log "ERROR" "Port 3129 non ouvert"
     exit 1
 fi
 
@@ -596,7 +956,6 @@ package_update: true
 package_upgrade: true
 
 packages:
-  - squid
   - apache2-utils
   - curl
   - net-tools
@@ -620,13 +979,8 @@ runcmd:
   - source /tmp/proxy-vars.sh
   - bash /tmp/configure-proxy.sh
 EOF
-
-    # Remplacer les variables dans le fichier
-    sed -i "s/\${STORAGE_ACCOUNT}/$STORAGE_ACCOUNT/g" "cloud-init-$VM_NAME.yaml"
-    sed -i "s/\${CONTAINER_NAME}/$CONTAINER_NAME/g" "cloud-init-$VM_NAME.yaml"
-    sed -i "s/\${SAS_TOKEN}/$SAS_TOKEN/g" "cloud-init-$VM_NAME.yaml"
-    sed -i "s/\${VM_NAME}/$VM_NAME/g" "cloud-init-$VM_NAME.yaml"
 }
+
 # Créer les nouvelles machines et ajouter leurs configurations
 for ((i=0; i<MACHINE_COUNT; i++)); do
     PROXY_PORT=$((PROXY_PORT_BASE + i))
@@ -721,11 +1075,11 @@ cat <<EOF > cloud-init-haproxy.yaml
 write_files:
   - path: /tmp/haproxy_frontends.txt
     content: |
-$(echo -e "$HAPROXY_FRONTENDS" | sed 's/^/      /')
+$(echo -e "$HAPROXY_FRONTENDS")
     permissions: '0644'
   - path: /tmp/haproxy_backends.txt
     content: |
-$(echo -e "$HAPROXY_BACKENDS" | sed 's/^/      /')
+$(echo -e "$HAPROXY_BACKENDS")
     permissions: '0644'
 
 package_update: true
