@@ -324,16 +324,7 @@ if [ $install_status -ne 0 ]; then
     exit 1
 fi
 
-cp -r src/mime.conf /etc/squid/
-cp -r errors/en/* /usr/share/squid/errors/
-cp -f src/security_file_certgen /usr/lib/squid/
-cp -f lib/basic_ncsa_auth /usr/lib/squid/
-
-chmod 755 /usr/lib/squid/security_file_certgen
-chmod 755 /usr/lib/squid/basic_ncsa_auth
-
 log "INFO" "Installation des fichiers de configuration..."
-mkdir -p /etc/squid
 mkdir -p /usr/share/squid/errors
 mkdir -p /usr/lib/squid
 
@@ -426,12 +417,48 @@ for file in "${REQUIRED_FILES[@]}"; do
 done
 
 log "INFO" "Installation des fichiers de configuration..."
-mkdir -p /usr/share/squid/icons
-mkdir -p /usr/share/squid/errors
+cd /tmp/squid-5.9
 
-cp -r icons/* /usr/share/squid/icons/ || log "WARNING" "Pas d'icônes trouvées"
-cp -r errors/en/* /usr/share/squid/errors/
-cp src/mime.conf /etc/squid/
+# Recherche des fichiers nécessaires
+log "INFO" "Recherche des fichiers sources..."
+find . -name "mime.conf" -type f
+find . -name "security_file_certgen" -type f
+find . -name "basic_ncsa_auth" -type f
+
+# Copie des fichiers avec gestion des erreurs
+if ! cp -r errors/* /usr/share/squid/errors/; then
+    log "WARN" "Impossible de copier les fichiers d'erreur depuis errors/"
+    if ! cp -r src/errors/* /usr/share/squid/errors/; then
+        log "ERROR" "Impossible de copier les fichiers d'erreur depuis src/errors/"
+        exit 1
+    fi
+fi
+
+if ! cp src/mime.conf.default /etc/squid/mime.conf; then
+    if ! cp -f src/mime.conf /etc/squid/; then
+        log "ERROR" "Impossible de copier mime.conf"
+        exit 1
+    fi
+fi
+
+security_certgen=$(find . -name "security_file_certgen" -type f)
+if [ -n "$security_certgen" ]; then
+    cp "$security_certgen" /usr/lib/squid/
+else
+    log "ERROR" "security_file_certgen non trouvé"
+    exit 1
+fi
+
+basic_auth=$(find . -name "basic_ncsa_auth" -type f)
+if [ -n "$basic_auth" ]; then
+    cp "$basic_auth" /usr/lib/squid/
+else
+    log "ERROR" "basic_ncsa_auth non trouvé"
+    exit 1
+fi
+
+chmod 755 /usr/lib/squid/security_file_certgen
+chmod 755 /usr/lib/squid/basic_ncsa_auth
 
 chown -R proxy:proxy /usr/share/squid
 chown -R proxy:proxy /etc/squid
@@ -530,20 +557,21 @@ chmod 750 /var/spool/squid
 
 log "Initialisation de la base SSL..."
 log "INFO" "Préparation de la base SSL..."
-rm -rf /var/lib/squid/ssl_db
 mkdir -p /var/lib/squid/ssl_db
 chown -R proxy:proxy /var/lib/squid
-chmod 750 /var/lib/squid
-chmod 750 /var/lib/squid/ssl_db
+chmod -R 750 /var/lib/squid
+chmod -R 750 /var/lib/squid/ssl_db
+
+install -d -m 755 -o proxy -g proxy /var/lib/squid
+install -d -m 750 -o proxy -g proxy /var/lib/squid/ssl_db
 
 log "INFO" "Initialisation SSL..."
-if [ ! -f /usr/lib/squid/security_file_certgen ]; then
-    log "ERROR" "security_file_certgen manquant"
+if ! su -s /bin/bash proxy -c "/usr/lib/squid/security_file_certgen -c -s /var/lib/squid/ssl_db -M 4MB"; then
+    log "ERROR" "Impossible d'initialiser la base SSL"
+    ls -la /var/lib/squid/
+    ls -la /var/lib/squid/ssl_db
     exit 1
 fi
-
-su -s /bin/bash proxy -c "/usr/lib/squid/security_file_certgen -c -s /var/lib/squid/ssl_db -M 4MB"
-check_error $? "Initialisation SSL"
 
 # Initialisation du cache
 log "Initialisation du cache..."
