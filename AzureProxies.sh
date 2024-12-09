@@ -162,62 +162,97 @@ check_required_vars() {
     fi
 }
 
-# Fonction de configuration des répertoires SSL
 setup_ssl_directories() {
     log "INFO" "Configuration des répertoires SSL..."
     
-    # Arrêt du service si en cours
+    # Arrêt complet de squid
     systemctl stop squid || true
     killall -9 squid 2>/dev/null || true
     sleep 2
     
     # Nettoyage complet
+    log "INFO" "Nettoyage des répertoires existants..."
     rm -rf /var/lib/squid/ssl_db
     rm -rf /var/cache/squid/*
     
-    # Création de la structure
+    log "INFO" "Création des répertoires avec les permissions correctes..."
+    # Créer d'abord le répertoire parent avec les bonnes permissions
     install -d -m 755 /var/lib/squid
-    install -d -m 750 /var/lib/squid/ssl_db
-    install -d -m 750 /var/cache/squid
+    chown proxy:proxy /var/lib/squid
     
-    # Configuration des permissions
-    chown -R proxy:proxy /var/lib/squid /var/cache/squid
     
-    # Vérification des permissions
-    if ! su -s /bin/bash proxy -c "test -w /var/lib/squid/ssl_db"; then
-        log "ERROR" "L'utilisateur proxy ne peut pas écrire dans ssl_db"
-        ls -la /var/lib/squid/ssl_db
-        return 1
-    fi
-    
+    log "INFO" "Structure des répertoires créée"
     return 0
 }
 
-# Fonction d'initialisation SSL
 initialize_ssl_db() {
     log "INFO" "Initialisation de la base SSL..."
     
-    # Vérification préalable
+    # Vérification du binaire
     if [ ! -x "/usr/lib/squid/security_file_certgen" ]; then
         log "ERROR" "security_file_certgen n'existe pas ou n'est pas exécutable"
         return 1
     fi
     
+    # S'assurer que le répertoire parent existe avec les bonnes permissions
+    if [ ! -d "/var/lib/squid" ]; then
+        log "ERROR" "Répertoire parent /var/lib/squid manquant"
+        return 1
+    fi
+    
+    if [ -d "/var/lib/squid/ssl_db" ]; then
+        log "INFO" "Suppression de l'ancien répertoire ssl_db..."
+        rm -rf /var/lib/squid/ssl_db
+    fi
+    
     # Initialisation avec l'utilisateur proxy
-    if ! su -s /bin/bash proxy -c "/usr/lib/squid/security_file_certgen -c -s /var/lib/squid/ssl_db -M 4MB"; then
-        log "ERROR" "Échec de l'initialisation SSL"
+    cmd="/usr/lib/squid/security_file_certgen -c -s /var/lib/squid/ssl_db -M 4MB"
+    log "INFO" "Exécution de: $cmd"
+    
+    output=$(su -s /bin/bash proxy -c "$cmd" 2>&1)
+    result=$?
+    
+    if [ $result -ne 0 ]; then
+        log "ERROR" "Échec de l'initialisation SSL avec sortie:"
+        echo "$output"
+        
+        # Information de debug
+        log "DEBUG" "Permissions du répertoire parent:"
+        ls -ld /var/lib/squid
+        
+        log "DEBUG" "Processus en cours d'exécution sous l'utilisateur proxy:"
+        ps -u proxy
+        
         return 1
     fi
     
     # Vérification post-initialisation
-    if [ ! -f "/var/lib/squid/ssl_db/index.txt" ]; then
-        log "ERROR" "Fichiers SSL manquants après initialisation"
+    if [ ! -d "/var/lib/squid/ssl_db" ] || [ ! -f "/var/lib/squid/ssl_db/index.txt" ]; then
+        log "ERROR" "La base SSL n'a pas été correctement initialisée"
+        ls -la /var/lib/squid/ssl_db/ || true
         return 1
     fi
     
+    log "INFO" "Base SSL initialisée avec succès"
     return 0
 }
 
+# Dans le script principal
+log "INFO" "Initialisation de l'environnement SSL..."
+if ! setup_ssl_directories; then
+    log "ERROR" "Échec de la configuration des répertoires SSL"
+    exit 1
+fi
+
+# Pause pour s'assurer que tout est synchronisé
+sync
+sleep 2
+
+log "INFO" "Initialisation de la base SSL..."
+if ! initialize_ssl_db; then
+    log "ERROR" "Échec de l'initialisation SSL"
+    exit 1
+fi
 # ------- DÉBUT DE L'EXÉCUTION PRINCIPALE -------
 
 log "INFO" "Début de l'installation de Squid"
