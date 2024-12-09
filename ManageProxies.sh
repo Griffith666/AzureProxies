@@ -198,51 +198,7 @@ delete_vm_resources() {
 
     local public_ip_name="${vm_name}PublicIP"
 
-    # 1. Vérifier et récupérer les informations de l'interface réseau
-    if [ -n "$nic_name" ] && az network nic show --resource-group "$RESOURCE_GROUP" --name "$nic_name" &>/dev/null; then
-        # Vérifier si un NSG est attaché
-        local attached_nsg=$(az network nic show \
-            --resource-group "$RESOURCE_GROUP" \
-            --name "$nic_name" \
-            --query "networkSecurityGroup.id" -o tsv)
-        
-        if [ -n "$attached_nsg" ]; then
-            info_msg "Dissociation du NSG de l'interface réseau..."
-            az network nic update \
-                --resource-group "$RESOURCE_GROUP" \
-                --name "$nic_name" \
-                --network-security-group "" \
-                --no-wait
-            
-            sleep 5
-        fi
-
-        # Récupérer le nom de la configuration IP
-        local ip_config_name=$(az network nic show \
-            --resource-group "$RESOURCE_GROUP" \
-            --name "$nic_name" \
-            --query "ipConfigurations[0].name" -o tsv)
-
-        # Vérifier si une IP publique est attachée
-        local has_public_ip=$(az network nic show \
-            --resource-group "$RESOURCE_GROUP" \
-            --name "$nic_name" \
-            --query "ipConfigurations[0].publicIpAddress.id" -o tsv)
-        
-        if [ -n "$has_public_ip" ] && [ -n "$ip_config_name" ]; then
-            info_msg "Dissociation de l'IP publique de l'interface réseau..."
-            az network nic ip-config update \
-                --resource-group "$RESOURCE_GROUP" \
-                --name "$ip_config_name" \
-                --nic-name "$nic_name" \
-                --remove publicIpAddress \
-                --no-wait
-            
-            sleep 5
-        fi
-    fi
-
-    # 2. Supprimer la VM
+    # 1. Supprimer la VM directement (sans dissociation préalable)
     info_msg "Suppression de la VM $vm_name..."
     if az vm show --resource-group "$RESOURCE_GROUP" --name "$vm_name" &>/dev/null; then
         az vm delete \
@@ -255,8 +211,8 @@ delete_vm_resources() {
         sleep 10
     fi
 
-    # 3. Supprimer l'interface réseau
-    if az network nic show --resource-group "$RESOURCE_GROUP" --name "$nic_name" &>/dev/null; then
+    # 2. Supprimer l'interface réseau
+    if [ -n "$nic_name" ] && az network nic show --resource-group "$RESOURCE_GROUP" --name "$nic_name" &>/dev/null; then
         info_msg "Suppression de l'interface réseau $nic_name..."
         az network nic delete \
             --resource-group "$RESOURCE_GROUP" \
@@ -266,7 +222,7 @@ delete_vm_resources() {
         sleep 5
     fi
 
-    # 4. Supprimer le NSG si trouvé
+    # 3. Supprimer le NSG si trouvé
     if [ -n "$nsg_name" ]; then
         info_msg "Suppression du NSG $nsg_name..."
         az network nsg delete \
@@ -277,7 +233,7 @@ delete_vm_resources() {
         sleep 5
     fi
 
-    # 5. Supprimer l'IP publique
+    # 4. Supprimer l'IP publique
     if az network public-ip show --resource-group "$RESOURCE_GROUP" --name "$public_ip_name" &>/dev/null; then
         info_msg "Suppression de l'IP publique $public_ip_name..."
         az network public-ip delete \
@@ -286,7 +242,7 @@ delete_vm_resources() {
             --no-wait
     fi
     
-    # 6. Supprimer les disques
+    # 5. Supprimer les disques
     if [ -n "$os_disk" ]; then
         info_msg "Suppression du disque OS $os_disk..."
         az disk delete --resource-group "$RESOURCE_GROUP" --name "$os_disk" --yes --no-wait
