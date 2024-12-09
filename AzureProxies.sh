@@ -303,32 +303,59 @@ for package in "${PACKAGES[@]}"; do
     check_error $? "Installation de $package"
 done
 
-# Configuration du module tproxy
-log "INFO" "Configuration du module tproxy..."
-modprobe iptable_mangle
-modprobe nf_tproxy_ipv4
-echo "iptable_mangle" >> /etc/modules
-echo "nf_tproxy_ipv4" >> /etc/modules
+setup_tproxy() {
+    log "INFO" "Configuration de TPROXY..."
+    
+    # Activation des modules nécessaires
+    modprobe iptable_mangle
+    modprobe nf_tproxy_ipv4
+    modprobe nf_socket_ipv4
+    
+    # Ajout des modules au chargement automatique
+    cat > /etc/modules-load.d/tproxy.conf <<EOL
+iptable_mangle
+nf_tproxy_ipv4
+nf_socket_ipv4
+EOL
 
-# Configuration iptables
-iptables -t mangle -N DIVERT
-iptables -t mangle -A DIVERT -j MARK --set-mark 1
-iptables -t mangle -A DIVERT -j ACCEPT
-iptables -t mangle -A PREROUTING -p tcp -m socket -j DIVERT
-iptables -t mangle -A PREROUTING -p tcp --dport 80 -j TPROXY --tproxy-mark 0x1/0x1 --on-port 3128
-iptables -t mangle -A PREROUTING -p tcp --dport 443 -j TPROXY --tproxy-mark 0x1/0x1 --on-port 3129
+    # Configuration sysctl pour TPROXY
+    cat > /etc/sysctl.d/10-tproxy.conf <<EOL
+net.ipv4.ip_forward=1
+net.ipv4.conf.all.send_redirects=0
+net.ipv4.conf.default.send_redirects=0
+net.ipv4.conf.all.accept_redirects=0
+net.ipv4.conf.default.accept_redirects=0
+EOL
 
-# Configuration iptables-persistent
-echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections
-echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections
-DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent
-check_error $? "Installation de iptables-persistent"
+    # Application des paramètres sysctl
+    sysctl -p /etc/sysctl.d/10-tproxy.conf
 
-netfilter-persistent save
-check_error $? "Sauvegarde des règles iptables"
+    # Configuration iptables pour TPROXY
+    iptables -t mangle -N DIVERT
+    iptables -t mangle -A DIVERT -j MARK --set-mark 1
+    iptables -t mangle -A DIVERT -j ACCEPT
 
-sysctl -w net.ipv4.ip_nonlocal_bind=1
-echo "net.ipv4.ip_nonlocal_bind=1" >> /etc/sysctl.conf
+    iptables -t mangle -A PREROUTING -p tcp -m socket -j DIVERT
+    iptables -t mangle -A PREROUTING -p tcp --dport 80 -j TPROXY --tproxy-mark 0x1/0x1 --on-port 3128
+    iptables -t mangle -A PREROUTING -p tcp --dport 443 -j TPROXY --tproxy-mark 0x1/0x1 --on-port 3129
+
+    # Sauvegarde des règles iptables
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+        netfilter-persistent save
+    else
+        mkdir -p /etc/iptables
+        iptables-save > /etc/iptables/rules.v4
+    fi
+
+    # Vérification de la configuration
+    if ! grep -q "nf_tproxy_ipv4" /proc/modules; then
+        log "ERROR" "Le module TPROXY n'est pas chargé"
+        return 1
+    fi
+
+    log "INFO" "Configuration TPROXY terminée"
+    return 0
+}
 
 # Téléchargement et compilation de Squid
 cd /tmp
@@ -459,8 +486,9 @@ fi
 cp "$basic_auth" /usr/lib/squid/
 chmod 755 /usr/lib/squid/basic_ncsa_auth
 
-# Configuration de Squid
-cat > /etc/squid/squid.conf <<EOL
+create_squid_config() {
+    log "INFO" "Création de la configuration Squid..."
+    cat > /etc/squid/squid.conf <<EOLL
 # Ports d'écoute
 http_port 3128 tproxy
 https_port 3129 tproxy ssl-bump cert=/etc/squid/ssl/squid.pem generate-host-certificates=on dynamic_cert_mem_cache_size=4MB tls-v1.2
@@ -515,7 +543,8 @@ forwarded_for delete
 request_header_access X-Forwarded-For deny all
 request_header_access Via deny all
 request_header_access Cache-Control deny all
-EOL
+EOLL
+}
 
 # Configuration de l'authentification
 touch /etc/squid/passwd
@@ -583,6 +612,12 @@ done
 log "INFO" "Initialisation du cache Squid..."
 if ! su -s /bin/bash proxy -c "/usr/sbin/squid -z"; then
     log "ERROR" "Échec de l'initialisation du cache"
+    exit 1
+fi
+
+log "INFO" "Configuration du support TPROXY..."
+if ! setup_tproxy; then
+    log "ERROR" "Échec de la configuration TPROXY"
     exit 1
 fi
 
