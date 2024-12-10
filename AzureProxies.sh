@@ -133,6 +133,10 @@ EOL
     iptables -t mangle -A PREROUTING -p tcp --dport 80 -j TPROXY --tproxy-mark 0x1/0x1 --on-port 3128
     iptables -t mangle -A PREROUTING -p tcp --dport 443 -j TPROXY --tproxy-mark 0x1/0x1 --on-port 3129
 
+    # Pré-configuration de iptables-persistent pour éviter l'interaction
+    echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections
+    echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections
+
     # Sauvegarde des règles
     mkdir -p /etc/iptables
     iptables-save > /etc/iptables/rules.v4
