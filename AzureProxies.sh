@@ -221,6 +221,22 @@ setup_ssl_certificates() {
     return 0
 }
 
+# Vérification des variables requises
+check_required_vars() {
+    local missing_vars=()
+    for var in VM_NAME PROXY_PORT PROXY_USERNAME PROXY_PASSWORD; do
+        if [ -z "${!var}" ]; then
+            missing_vars+=($var)
+            log "WARNING" "Variable manquante: $var"
+        fi
+    done
+    
+    if [ ${#missing_vars[@]} -ne 0 ]; then
+        log "ERROR" "Variables manquantes: ${missing_vars[*]}"
+        exit 1
+    fi
+}
+
 # DÉBUT EXÉCUTION PRINCIPALE
 log "INFO" "Début installation Squid"
 
