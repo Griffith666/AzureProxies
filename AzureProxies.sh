@@ -184,20 +184,41 @@ initialize_ssl_db() {
     return 0
 }
 
-# Vérification des variables requises
-check_required_vars() {
-    local missing_vars=()
-    for var in VM_NAME PROXY_PORT PROXY_USERNAME PROXY_PASSWORD; do
-        if [ -z "${!var}" ]; then
-            missing_vars+=($var)
-            log "WARNING" "Variable manquante: $var"
-        fi
-    done
+setup_ssl_certificates() {
+    log "INFO" "Configuration des certificats SSL..."
     
-    if [ ${#missing_vars[@]} -ne 0 ]; then
-        log "ERROR" "Variables manquantes: ${missing_vars[*]}"
-        exit 1
-    fi
+    # Création du répertoire SSL
+    mkdir -p /etc/squid/ssl
+    cd /etc/squid/ssl
+    
+    # Génération du certificat CA
+    openssl req -new -newkey rsa:2048 -sha256 -days 3650 -nodes -x509 \
+        -extensions v3_ca \
+        -keyout squid-ca-key.pem \
+        -out squid-ca-cert.pem \
+        -subj "/C=FR/ST=Paris/L=Paris/O=ProxyAuth CA/CN=Proxy CA"
+    
+    # Génération du certificat serveur
+    openssl req -new -newkey rsa:2048 -sha256 -days 3650 -nodes \
+        -keyout squid.key \
+        -out squid.csr \
+        -subj "/C=FR/ST=Paris/L=Paris/O=ProxyAuth/CN=$VM_NAME"
+    
+    # Signature du certificat serveur
+    openssl x509 -req -days 3650 -in squid.csr \
+        -CA squid-ca-cert.pem \
+        -CAkey squid-ca-key.pem \
+        -CAcreateserial \
+        -out squid.crt
+    
+    # Création du fichier PEM combiné
+    cat squid.key squid.crt > squid.pem
+    
+    # Configuration des permissions
+    chmod 400 squid*.pem squid.key
+    chown proxy:proxy squid*.pem squid.key
+    
+    return 0
 }
 
 # DÉBUT EXÉCUTION PRINCIPALE
@@ -307,11 +328,15 @@ fi
 
 # Configuration Squid
 cat > /etc/squid/squid.conf <<EOL
+# Ports d'écoute
 http_port 3128 intercept
-https_port 3129 intercept ssl-bump cert=/etc/squid/ssl/squid.pem generate-host-certificates=on dynamic_cert_mem_cache_size=4MB tls-v1.2
+https_port 3129 intercept ssl-bump \
+    cert=/etc/squid/ssl/squid.pem \
+    generate-host-certificates=on \
+    dynamic_cert_mem_cache_size=4MB
 
+# ACLs de base
 acl localnet src all
-
 acl SSL_ports port 443
 acl Safe_ports port 80
 acl Safe_ports port 21
@@ -319,19 +344,26 @@ acl Safe_ports port 443
 acl Safe_ports port 1025-65535
 acl CONNECT method CONNECT
 
+# Règles d'accès
 http_access allow localhost manager
 http_access deny manager
 http_access allow localnet
 http_access allow localhost
 http_access deny all
 
+# Configuration SSL Bump
 ssl_bump server-first all
 sslcrtd_program /usr/lib/squid/security_file_certgen -s /var/lib/squid/ssl_db -M 4MB
 sslcrtd_children 5
 
+# Configuration TLS
+tls_outgoing_options options=NO_SSLv3,NO_TLSv1,NO_TLSv1_1 cipher=HIGH:MEDIUM:!RC4:!aNULL:!eNULL:!LOW:!3DES:!MD5:!EXP:!PSK:!SRP:!DSS
+
+# Configuration du cache
 cache_dir ufs /var/spool/squid 100 16 256
 coredump_dir /var/spool/squid
 
+# Patterns de rafraîchissement
 refresh_pattern ^ftp:           1440    20%     10080
 refresh_pattern ^gopher:        1440    0%      1440
 refresh_pattern -i (/cgi-bin/|\?) 0     0%      0
@@ -341,6 +373,11 @@ EOL
 # Initialisation cache
 if ! su -s /bin/bash proxy -c "/usr/sbin/squid -z"; then
     log "ERROR" "Échec initialisation cache"
+    exit 1
+fi
+
+if ! setup_ssl_certificates; then
+    log "ERROR" "Échec de la configuration des certificats SSL"
     exit 1
 fi
 
