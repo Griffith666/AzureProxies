@@ -238,118 +238,44 @@ check_required_vars() {
 }
 
 # DÉBUT EXÉCUTION PRINCIPALE
-log "INFO" "Début installation Squid"
-
-# Vérification variables
-if [ ! -f /tmp/proxy-vars.sh ]; then
-    log "ERROR" "Fichier de variables non trouvé"
-    exit 1
-fi
-
-source /tmp/proxy-vars.sh
-check_required_vars
-
-# Configuration TPROXY
-if ! setup_tproxy; then
-    log "ERROR" "Échec configuration TPROXY"
-    exit 1
-fi
-
-# Installation paquets
-PACKAGES=(
-    "build-essential"
-    "openssl"
-    "libssl-dev"
-    "pkg-config"
-    "apache2-utils"
-    "ssl-cert"
-    "libldap2-dev"
-    "libsasl2-dev"
-    "libxml2-dev"
-    "libpcre3-dev"
-    "libkrb5-dev"
-    "nettle-dev"
-    "libnetfilter-conntrack-dev"
-    "libpam0g-dev"
-    "libdb-dev"
-    "libexpat1-dev"
-    "libcdb-dev"
-    "libcap-dev"
-    "libecap3-dev"
-    "libsystemd-dev"
-    "iptables-persistent"
-)
-
-apt-get update
-for package in "${PACKAGES[@]}"; do
-    apt-get install -y $package
-    check_error $? "Installation $package"
-done
-
-# Compilation Squid
-cd /tmp
-wget http://www.squid-cache.org/Versions/v5/squid-5.9.tar.gz
-tar xzf squid-5.9.tar.gz
-cd squid-5.9
-
-./configure \
-    --prefix=/usr \
-    --localstatedir=/var \
-    --libexecdir=/usr/lib/squid \
-    --datadir=/usr/share/squid \
-    --sysconfdir=/etc/squid \
-    --with-default-user=proxy \
-    --with-logdir=/var/log/squid \
-    --with-pidfile=/var/run/squid.pid \
-    --with-openssl \
-    --enable-ssl-crtd \
-    --enable-linux-netfilter \
-    --with-nat-devpoll \
-    --enable-ssl \
-    --enable-auth-basic="NCSA"
-
-make -j$(nproc)
-check_error $? "Compilation"
-
-make install
-check_error $? "Installation"
-
-# Configuration répertoires
-for dir in /etc/squid /var/log/squid /var/spool/squid /var/cache/squid /usr/lib/squid /usr/share/squid/errors; do
-    install -d -m 750 "$dir"
-    chown proxy:proxy "$dir"
-done
-
-# Installation security_file_certgen
-security_certgen=$(find . -name "security_file_certgen" -type f)
-if [ -n "$security_certgen" ]; then
-    install -m 755 "$security_certgen" /usr/lib/squid/security_file_certgen
-    chown root:proxy /usr/lib/squid/security_file_certgen
-else
-    log "ERROR" "security_file_certgen non trouvé"
-    exit 1
-fi
-
-# Configuration SSL
+# Section Configuration SSL révisée
 log "INFO" "Configuration SSL..."
+
+# 1. Configuration des répertoires SSL
 if ! setup_ssl_directories; then
     log "ERROR" "Échec configuration répertoires SSL"
     exit 1
 fi
 
+# 2. Génération des certificats SSL
+if ! setup_ssl_certificates; then
+    log "ERROR" "Échec de la génération des certificats SSL"
+    exit 1
+fi
+
+# 3. Initialisation de la base SSL
 if ! initialize_ssl_db; then
     log "ERROR" "Échec initialisation SSL"
     exit 1
 fi
 
-# Configuration Squid
+# 4. Vérification des fichiers SSL
+log "INFO" "Vérification des fichiers SSL..."
+for file in \
+    "/etc/squid/ssl/squid.pem" \
+    "/etc/squid/ssl/squid-ca-cert.pem" \
+    "/var/lib/squid/ssl_db"; do
+    if [ ! -e "$file" ]; then
+        log "ERROR" "Fichier SSL manquant: $file"
+        exit 1
+    fi
+done
+
+# 5. Configuration de Squid
 cat > /etc/squid/squid.conf <<EOL
 # Ports d'écoute
 http_port 3128 intercept
-https_port 3129 intercept ssl-bump \
-    cert=/etc/squid/ssl/squid.pem \
-    generate-host-certificates=on \
-    dynamic_cert_mem_cache_size=4MB
+https_port 3129 intercept ssl-bump generate-host-certificates=on dynamic_cert_mem_cache_size=4MB cert=/etc/squid/ssl/squid.pem
 
 # ACLs de base
 acl localnet src all
@@ -360,20 +286,21 @@ acl Safe_ports port 443
 acl Safe_ports port 1025-65535
 acl CONNECT method CONNECT
 
+# SSL Bump rules
+acl step1 at_step SslBump1
+ssl_bump peek step1
+ssl_bump bump all
+
+# Configuration SSL
+sslcrtd_program /usr/lib/squid/security_file_certgen -s /var/lib/squid/ssl_db -M 4MB
+sslcrtd_children 5
+
 # Règles d'accès
 http_access allow localhost manager
 http_access deny manager
 http_access allow localnet
 http_access allow localhost
 http_access deny all
-
-# Configuration SSL Bump
-ssl_bump server-first all
-sslcrtd_program /usr/lib/squid/security_file_certgen -s /var/lib/squid/ssl_db -M 4MB
-sslcrtd_children 5
-
-# Configuration TLS
-tls_outgoing_options options=NO_SSLv3,NO_TLSv1,NO_TLSv1_1 cipher=HIGH:MEDIUM:!RC4:!aNULL:!eNULL:!LOW:!3DES:!MD5:!EXP:!PSK:!SRP:!DSS
 
 # Configuration du cache
 cache_dir ufs /var/spool/squid 100 16 256
@@ -386,18 +313,14 @@ refresh_pattern -i (/cgi-bin/|\?) 0     0%      0
 refresh_pattern .               0       20%     4320
 EOL
 
-# Initialisation cache
+# 6. Initialisation du cache
+log "INFO" "Initialisation du cache Squid..."
 if ! su -s /bin/bash proxy -c "/usr/sbin/squid -z"; then
     log "ERROR" "Échec initialisation cache"
     exit 1
 fi
 
-if ! setup_ssl_certificates; then
-    log "ERROR" "Échec de la configuration des certificats SSL"
-    exit 1
-fi
-
-# Service systemd
+# Configuration du service systemd
 cat > /etc/systemd/system/squid.service <<EOL
 [Unit]
 Description=Squid proxy server
@@ -416,20 +339,32 @@ Restart=always
 WantedBy=multi-user.target
 EOL
 
+# Démarrage du service
 systemctl daemon-reload
 systemctl enable squid
-systemctl start squid
+systemctl restart squid
+
+# Pause pour laisser le temps au service de démarrer
+sleep 10
 
 # Vérifications finales
-sleep 10
 if ! systemctl is-active --quiet squid; then
-    log "ERROR" "Squid non démarré"
+    log "ERROR" "Squid n'a pas démarré correctement"
+    log "ERROR" "Status du service:"
     systemctl status squid
+    log "ERROR" "Dernières lignes du journal:"
+    tail -n 50 /var/log/squid/cache.log
     exit 1
 fi
 
+# Vérification des ports
 if ! netstat -tulpn | grep -q ":3128"; then
     log "ERROR" "Port 3128 non ouvert"
+    exit 1
+fi
+
+if ! netstat -tulpn | grep -q ":3129"; then
+    log "ERROR" "Port 3129 non ouvert"
     exit 1
 fi
 
