@@ -449,9 +449,8 @@ fi
 # 4. Configuration de Squid
 cat > /etc/squid/squid.conf <<EOL
 # Ports d'écoute
-http_port 3128
-http_port 0.0.0.0:3128 tproxy
-https_port 0.0.0.0:3129 tproxy ssl-bump generate-host-certificates=on dynamic_cert_mem_cache_size=4MB cert=/etc/squid/ssl/squid.pem key=/etc/squid/ssl/squid.key cipher=HIGH:MEDIUM:!LOW:!RC4:!SEED:!IDEA:!3DES:!MD5:!EXP:!PSK:!DSS options=NO_TLSv1,NO_SSLv3
+http_port 0.0.0.0:3128 intercept
+https_port 0.0.0.0:3129 intercept ssl-bump generate-host-certificates=on dynamic_cert_mem_cache_size=4MB cert=/etc/squid/ssl/squid.pem key=/etc/squid/ssl/squid.key cipher=HIGH:MEDIUM:!LOW:!RC4:!SEED:!IDEA:!3DES:!MD5:!EXP:!PSK:!DSS options=NO_TLSv1,NO_SSLv3
 
 # Options globales
 visible_hostname ${VM_NAME}
@@ -502,14 +501,12 @@ ipcache_size 4096
 ipcache_low 90
 ipcache_high 95
 
+# Configuration TLS
+tls_outgoing_options cipher=HIGH:MEDIUM:!LOW:!RC4:!SEED:!IDEA:!3DES:!MD5:!EXP:!PSK:!DSS options=NO_TLSv1,NO_SSLv3
+
 # Configuration avancée
 always_direct allow all
 ssl_unclean_shutdown on
-sslproxy_session_ttl 300
-sslproxy_session_cache_size 4 MB
-
-# Configuration TLS supplémentaire
-tls_outgoing_options cipher=HIGH:MEDIUM:!LOW:!RC4:!SEED:!IDEA:!3DES:!MD5:!EXP:!PSK:!DSS options=NO_TLSv1,NO_SSLv3
 
 # Patterns de rafraîchissement
 refresh_pattern ^ftp:           1440    20%     10080
@@ -525,9 +522,6 @@ cache_store_log none
 
 # Debug settings
 debug_options ALL,1 33,2 28,9
-
-# Spécification de l'emplacement des icônes
-icon_directory /usr/share/squid/icons
 EOL
 
 # Vérification de la configuration
@@ -555,7 +549,6 @@ PIDFile=/var/run/squid/squid.pid
 User=proxy
 RuntimeDirectory=squid
 RuntimeDirectoryMode=0755
-ExecStartPre=/bin/rm -f /var/run/squid/squid.pid
 ExecStartPre=/usr/sbin/squid -N -z
 ExecStartPre=/usr/sbin/squid -k parse
 ExecStart=/usr/sbin/squid -YD -f /etc/squid/squid.conf
