@@ -276,7 +276,7 @@ log "INFO" "Configuration de Squid..."
     --sysconfdir=/etc/squid \
     --with-default-user=proxy \
     --with-logdir=/var/log/squid \
-    --with-pidfile=/var/run/squid.pid \
+    --with-pidfile=/var/run/squid/squid.pid \
     --with-openssl \
     --enable-ssl-crtd \
     --enable-linux-netfilter \
@@ -292,11 +292,36 @@ log "INFO" "Installation de Squid..."
 make install
 check_error $? "Installation"
 
-# Configuration des répertoires
-for dir in /etc/squid /var/log/squid /var/spool/squid /var/cache/squid /usr/lib/squid /usr/share/squid/errors; do
-    install -d -m 750 "$dir"
-    chown proxy:proxy "$dir"
+# Création et configuration du répertoire PID
+log "INFO" "Configuration du répertoire PID..."
+mkdir -p /var/run/squid
+chown proxy:proxy /var/run/squid
+chmod 755 /var/run/squid
+
+# Configuration des répertoires avec permissions correctes
+log "INFO" "Configuration des répertoires..."
+directories=(
+    "/etc/squid"
+    "/var/log/squid"
+    "/var/spool/squid"
+    "/var/cache/squid"
+    "/var/run/squid"
+    "/usr/lib/squid"
+    "/var/lib/squid"
+    "/var/lib/squid/ssl_db"
+)
+
+for dir in "${directories[@]}"; do
+    if [ ! -d "$dir" ]; then
+        install -d -m 755 "$dir"
+    fi
+    chown -R proxy:proxy "$dir"
+    chmod -R 755 "$dir"
 done
+
+# Synchronisation pour s'assurer que les modifications sont appliquées
+sync
+sleep 2
 
 # Installation des binaires SSL
 security_certgen=$(find . -name "security_file_certgen" -type f)
@@ -424,8 +449,12 @@ fi
 # 4. Configuration de Squid
 cat > /etc/squid/squid.conf <<EOL
 # Ports d'écoute
-http_port 3128 intercept
-https_port 3129 intercept ssl-bump generate-host-certificates=on dynamic_cert_mem_cache_size=4MB cert=/etc/squid/ssl/squid.pem
+http_port 3128
+http_port 0.0.0.0:3128 tproxy
+https_port 0.0.0.0:3129 tproxy ssl-bump generate-host-certificates=on dynamic_cert_mem_cache_size=4MB cert=/etc/squid/ssl/squid.pem key=/etc/squid/ssl/squid.key cipher=HIGH:MEDIUM:!LOW:!RC4:!SEED:!IDEA:!3DES:!MD5:!EXP:!PSK:!DSS options=NO_TLSv1,NO_SSLv3
+
+# Options globales
+visible_hostname ${VM_NAME}
 
 # ACLs de base
 acl localnet src all
@@ -438,12 +467,18 @@ acl CONNECT method CONNECT
 
 # SSL Bump rules
 acl step1 at_step SslBump1
-ssl_bump peek step1
+acl step2 at_step SslBump2
+acl step3 at_step SslBump3
+ssl_bump peek step1 all
+ssl_bump peek step2 all
+ssl_bump splice step3 all
 ssl_bump bump all
 
 # Configuration SSL
 sslcrtd_program /usr/lib/squid/security_file_certgen -s /var/lib/squid/ssl_db -M 4MB
-sslcrtd_children 5
+sslcrtd_children 5 startup=1
+sslproxy_cert_error allow all
+tls_outgoing_options flags=DONT_VERIFY_PEER
 
 # Règles d'accès
 http_access allow localhost manager
@@ -455,20 +490,101 @@ http_access deny all
 # Configuration du cache
 cache_dir ufs /var/spool/squid 100 16 256
 coredump_dir /var/spool/squid
+maximum_object_size 4096 MB
+
+# Configuration IPv4
+tcp_outgoing_address 0.0.0.0
+
+# Configuration DNS
+dns_nameservers 8.8.8.8 8.8.4.4
+dns_packet_max 4096 bytes
+ipcache_size 4096
+ipcache_low 90
+ipcache_high 95
+
+# Configuration avancée
+always_direct allow all
+ssl_unclean_shutdown on
+sslproxy_session_ttl 300
+sslproxy_session_cache_size 4 MB
+
+# Configuration TLS supplémentaire
+tls_outgoing_options cipher=HIGH:MEDIUM:!LOW:!RC4:!SEED:!IDEA:!3DES:!MD5:!EXP:!PSK:!DSS options=NO_TLSv1,NO_SSLv3
 
 # Patterns de rafraîchissement
 refresh_pattern ^ftp:           1440    20%     10080
 refresh_pattern ^gopher:        1440    0%      1440
 refresh_pattern -i (/cgi-bin/|\?) 0     0%      0
 refresh_pattern .               0       20%     4320
+
+# Configuration des logs
+logformat combined %>a %[ui %[un [%tl] "%rm %ru HTTP/%rv" %Hs %<st "%{Referer}>h" "%{User-Agent}>h" %Ss:%Sh
+access_log daemon:/var/log/squid/access.log combined
+cache_log /var/log/squid/cache.log
+cache_store_log none
+
+# Debug settings
+debug_options ALL,1 33,2 28,9
+
+# Spécification de l'emplacement des icônes
+icon_directory /usr/share/squid/icons
 EOL
 
+# Vérification de la configuration
 log "INFO" "Vérification de la configuration Squid..."
-if ! squid -k parse; then
+if ! /usr/sbin/squid -k parse; then
     log "ERROR" "Configuration Squid invalide"
     squid -k parse
     exit 1
 fi
+
+log "INFO" "Installation des icônes Squid..."
+mkdir -p /usr/share/squid/icons
+cp -r /tmp/squid-5.9/icons/* /usr/share/squid/icons/
+chown -R proxy:proxy /usr/share/squid/icons
+
+# Configuration du service systemd
+cat > /etc/systemd/system/squid.service <<EOL
+[Unit]
+Description=Squid proxy server
+After=network.target
+
+[Service]
+Type=forking
+PIDFile=/var/run/squid/squid.pid
+User=proxy
+RuntimeDirectory=squid
+RuntimeDirectoryMode=0755
+ExecStartPre=/bin/rm -f /var/run/squid/squid.pid
+ExecStartPre=/usr/sbin/squid -N -z
+ExecStartPre=/usr/sbin/squid -k parse
+ExecStart=/usr/sbin/squid -YD -f /etc/squid/squid.conf
+ExecReload=/usr/sbin/squid -k reconfigure
+ExecStop=/usr/sbin/squid -k shutdown
+Restart=always
+RestartSec=5s
+TimeoutStartSec=300
+LimitNOFILE=65535
+Environment=SQUID_CONF=/etc/squid/squid.conf
+
+[Install]
+WantedBy=multi-user.target
+EOL
+
+log "INFO" "Préparation du démarrage de Squid..."
+
+directories=(
+    "/var/run/squid"
+    "/var/log/squid"
+    "/var/cache/squid"
+    "/var/spool/squid"
+)
+
+for dir in "${directories[@]}"; do
+    mkdir -p "$dir"
+    chown -R proxy:proxy "$dir"
+    chmod 755 "$dir"
+done
 
 
 # Initialisation du cache
@@ -478,54 +594,26 @@ if ! su -s /bin/bash proxy -c "/usr/sbin/squid -z"; then
     exit 1
 fi
 
-# Vérification de la configuration
-log "INFO" "Vérification de la configuration Squid..."
-if ! /usr/sbin/squid -k parse; then
-    log "ERROR" "Configuration Squid invalide"
+log "INFO" "Vérification de la configuration..."
+if ! su -s /bin/bash proxy -c "/usr/sbin/squid -k parse"; then
+    log "ERROR" "Configuration invalide"
     exit 1
 fi
 
-# Configuration du service
-cat > /etc/systemd/system/squid.service <<EOL
-[Unit]
-Description=Squid proxy server
-After=network.target
-
-[Service]
-Type=forking
-PIDFile=/run/squid.pid
-User=proxy
-ExecStartPre=/usr/sbin/squid -N -z
-ExecStart=/usr/sbin/squid -YC
-ExecReload=/usr/sbin/squid -k reconfigure
-ExecStop=/usr/sbin/squid -k shutdown
-Restart=on-failure
-RestartSec=5s
-TimeoutStartSec=300
-
-[Install]
-WantedBy=multi-user.target
-EOL
-
-# Démarrage du service avec plus de contrôles
-log "INFO" "Démarrage de Squid..."
+# Rechargement systemd et redémarrage du service
 systemctl daemon-reload
-systemctl enable squid
-
-# Arrêt forcé si déjà en cours
 systemctl stop squid || true
-sleep 2
-killall -9 squid 2>/dev/null || true
-sleep 2
-
-# Réinitialisation des répertoires critiques
-rm -f /run/squid.pid
 
 # Démarrage avec vérifications
-log "INFO" "Tentative de démarrage Squid..."
+log "INFO" "Démarrage de Squid avec debug..."
 if ! systemctl start squid; then
-    log "ERROR" "Échec du démarrage initial de Squid"
-    systemctl status squid
+    log "ERROR" "Échec du démarrage de Squid"
+    log "ERROR" "Contenu de cache.log:"
+    cat /var/log/squid/cache.log || true
+    log "ERROR" "Status du service:"
+    systemctl status squid -l
+    log "ERROR" "Journaux systemd:"
+    journalctl -u squid --no-pager -n 100
     exit 1
 fi
 
@@ -533,23 +621,12 @@ fi
 sleep 5
 
 # Vérification détaillée du statut
-if ! systemctl start squid; then
-    log "ERROR" "Échec du démarrage de Squid"
+log "INFO" "Vérification du statut après démarrage..."
+if ! systemctl is-active --quiet squid; then
+    log "ERROR" "Squid n'est pas actif"
     log "ERROR" "Contenu de cache.log:"
-    tail -n 50 /var/log/squid/cache.log || true
-    log "ERROR" "Contenu de access.log:"
-    tail -n 50 /var/log/squid/access.log || true
-    log "ERROR" "Status détaillé du service:"
-    systemctl status squid -l || true
-    log "ERROR" "Journaux systemd:"
-    journalctl -u squid --no-pager -n 100 || true
-    exit 1
-fi
-
-# Vérification des processus
-log "INFO" "Vérification des processus Squid..."
-if ! pgrep -x "squid" > /dev/null; then
-    log "ERROR" "Processus Squid non trouvé"
+    cat /var/log/squid/cache.log || true
+    log "ERROR" "Vérification des processus:"
     ps aux | grep squid
     exit 1
 fi
@@ -561,8 +638,9 @@ netstat -tulpn | grep squid || true
 # Attente supplémentaire pour l'ouverture des ports
 sleep 5
 
-if ! netstat -tulpn | grep -q ":3128"; then
-    log "ERROR" "Port 3128 non ouvert"
+# Vérification spécifique pour IPv4
+if ! netstat -tulpn | grep -q "0.0.0.0:3128"; then
+    log "ERROR" "Port 3128 non ouvert sur IPv4"
     log "INFO" "Liste des ports ouverts:"
     netstat -tulpn
     log "INFO" "Status du pare-feu:"
@@ -570,8 +648,8 @@ if ! netstat -tulpn | grep -q ":3128"; then
     exit 1
 fi
 
-if ! netstat -tulpn | grep -q ":3129"; then
-    log "ERROR" "Port 3129 non ouvert"
+if ! netstat -tulpn | grep -q "0.0.0.0:3129"; then
+    log "ERROR" "Port 3129 non ouvert sur IPv4"
     log "INFO" "Liste des ports ouverts:"
     netstat -tulpn
     exit 1
@@ -579,16 +657,43 @@ fi
 
 # Vérification finale des permissions
 log "INFO" "Vérification finale des permissions..."
-ls -la /var/log/squid/
-ls -la /var/cache/squid/
-ls -la /etc/squid/ssl/
-ls -la /var/lib/squid/ssl_db/
+for dir in "${directories[@]}"; do
+    if [ ! -d "$dir" ]; then
+        log "ERROR" "Répertoire manquant après installation: $dir"
+        exit 1
+    fi
+    
+    current_owner=$(stat -c '%U:%G' "$dir")
+    current_perms=$(stat -c '%a' "$dir")
+    
+    if [ "$current_owner" != "proxy:proxy" ]; then
+        log "ERROR" "Permissions incorrectes sur $dir (propriétaire: $current_owner)"
+        exit 1
+    fi
+    
+    if [ "$current_perms" != "755" ]; then
+        log "ERROR" "Permissions incorrectes sur $dir (permissions: $current_perms)"
+        exit 1
+    fi
+done
 
 # Message de succès avec plus d'informations
 log "INFO" "Installation Squid terminée avec succès"
 log "INFO" "Version installée: $(/usr/sbin/squid -v | head -n1)"
 log "INFO" "Ports ouverts:"
 netstat -tulpn | grep squid
+
+# Affichage des informations de configuration
+log "INFO" "Configuration réseau:"
+ip addr show
+
+log "INFO" "Routes configurées:"
+ip route show
+
+log "INFO" "Configuration DNS:"
+cat /etc/resolv.conf
+
+exit 0
 EOF
 
 # Charger le script dans le Blob Storage
