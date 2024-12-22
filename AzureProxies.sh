@@ -70,15 +70,60 @@ cat <<'EOF' > configure-proxy.sh
 #!/bin/bash
 set -e
 
-# Configuration du logging
-exec 1> >(tee -a /var/log/squid-setup.log) 2>&1
+# Configuration du logging avec une meilleure gestion de la mémoire
+exec 3>&1
+exec 4>&2
+log_file="/var/log/squid-setup.log"
+exec 1> >(stdbuf -oL tee -a "$log_file")
+exec 2> >(stdbuf -oL tee -a "$log_file" >&2)
 
-# Fonction de logging
+# Vérification de la mémoire disponible
+check_memory() {
+    local available_mem=$(free -m | awk '/^Mem:/ {print $7}')
+    if [ "$available_mem" -lt 512 ]; then
+        echo "WARNING: Low memory available ($available_mem MB). Cleaning up..." >&3
+        sync
+        echo 3 > /proc/sys/vm/drop_caches
+        sleep 2
+    fi
+}
+
+# Fonction de nettoyage
+cleanup() {
+    exec 1>&3
+    exec 2>&4
+    if [ -n "$!" ]; then
+        kill $! 2>/dev/null || true
+    fi
+}
+
+# Mise en place du trap
+trap cleanup EXIT INT TERM
+
+# Fonction de logging modifiée
 log() {
     local level=$1
     local message=$2
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $message" | tee -a /var/log/squid-setup.log
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] [$level] $message"
     logger -t squid-setup "$level: $message"
+    
+    # Vérifier la mémoire après chaque opération majeure
+    check_memory
+}
+
+# Fonction de pause avec vérification des ressources
+safe_sleep() {
+    local seconds=$1
+    local count=0
+    while [ $count -lt $seconds ]; do
+        sleep 1
+        count=$((count + 1))
+        # Vérifier la mémoire toutes les 5 secondes
+        if [ $((count % 5)) -eq 0 ]; then
+            check_memory
+        fi
+    done
 }
 
 # Fonction de vérification des erreurs
@@ -95,14 +140,83 @@ check_error() {
     fi
 }
 
+# Fonction de vérification des ports
+check_ports() {
+    local ports=(3128 3129 8080)
+    for port in "${ports[@]}"; do
+        if netstat -tuln | grep -q ":$port "; then
+            log "ERROR" "Port $port already in use"
+            lsof -i ":$port" || true
+            return 1
+        fi
+    done
+    return 0
+}
+
+# Fonction pour vérifier et arrêter une instance existante
+stop_existing_squid() {
+    local pid_file="/var/run/squid/squid.pid"
+    local max_attempts=3
+    local attempt=1
+
+    while [ $attempt -le $max_attempts ]; do
+        log "INFO" "Tentative $attempt d'arrêt de Squid..."
+        
+        # Vérifier si le fichier PID existe
+        if [ -f "$pid_file" ]; then
+            local pid=$(cat "$pid_file")
+            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                log "INFO" "Instance Squid trouvée avec PID $pid"
+                
+                # Tentative d'arrêt gracieux
+                kill -TERM "$pid"
+                sleep 5
+                
+                # Vérifier si le processus est toujours en vie
+                if kill -0 "$pid" 2>/dev/null; then
+                    log "WARNING" "Force kill du processus Squid (PID: $pid)..."
+                    kill -9 "$pid"
+                    sleep 2
+                fi
+            fi
+            
+            # Supprimer le fichier PID
+            rm -f "$pid_file"
+        fi
+        
+        # Nettoyer les sockets en TIME_WAIT
+        ss -K dst :3128 || true
+        ss -K dst :3129 || true
+        ss -K dst :8080 || true
+
+        # Vérifier et tuer tous les processus liés à squid
+        pkill -9 -f squid || true
+        
+        # Attendre la libération complète des ports
+        timeout 30 bash -c 'until ! netstat -tuln | grep -q ":3128\|:3129\|:8080"; do sleep 1; done' || true
+        
+        # Vérification finale
+        if ! pgrep squid >/dev/null && [ ! -f "$pid_file" ] && ! netstat -tuln | grep -q ":3128\|:3129\|:8080"; then
+            log "INFO" "Nettoyage réussi"
+            return 0
+        fi
+        
+        attempt=$((attempt + 1))
+        sleep 3
+    done
+    
+    log "ERROR" "Impossible d'arrêter l'instance Squid existante après $max_attempts tentatives"
+    return 1
+}
+
 # Configuration TPROXY
 setup_tproxy() {
     log "INFO" "Configuration de TPROXY..."
     
     # Activation des modules
-    modprobe iptable_mangle
-    modprobe nf_tproxy_ipv4
-    modprobe nf_socket_ipv4
+    modprobe iptable_mangle || true
+    modprobe nf_tproxy_ipv4 || true
+    modprobe nf_socket_ipv4 || true
     
     # Configuration du chargement automatique
     cat > /etc/modules-load.d/tproxy.conf <<EOL
@@ -129,13 +243,9 @@ EOL
     iptables -t mangle -A DIVERT -j ACCEPT
 
     # Configuration du routage transparent
-    iptables -t mangle -A PREROUTING -p tcp -m socket -j DIVERT
-    iptables -t mangle -A PREROUTING -p tcp --dport 80 -j TPROXY --tproxy-mark 0x1/0x1 --on-port 3128
-    iptables -t mangle -A PREROUTING -p tcp --dport 443 -j TPROXY --tproxy-mark 0x1/0x1 --on-port 3129
-
-    # Pré-configuration de iptables-persistent
-    echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections
-    echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections
+    iptables -t mangle -A PREROUTING -p tcp -m socket -j DIVERT || true
+    iptables -t mangle -A PREROUTING -p tcp --dport 80 -j TPROXY --tproxy-mark 0x1/0x1 --on-port 3128 || true
+    iptables -t mangle -A PREROUTING -p tcp --dport 443 -j TPROXY --tproxy-mark 0x1/0x1 --on-port 3129 || true
 
     # Sauvegarde des règles
     mkdir -p /etc/iptables
@@ -256,7 +366,7 @@ PACKAGES=(
 apt-get update
 for package in "${PACKAGES[@]}"; do
     log "INFO" "Installation de $package..."
-    apt-get install -y $package
+    DEBIAN_FRONTEND=noninteractive apt-get install -y $package
     check_error $? "Installation $package"
 done
 
@@ -292,6 +402,18 @@ log "INFO" "Installation de Squid..."
 make install
 check_error $? "Installation"
 
+# Installation des fichiers de configuration MIME
+log "INFO" "Installation des fichiers de configuration MIME..."
+mkdir -p /usr/share/squid
+if [ -f "/tmp/squid-5.9/src/mime.conf.default" ]; then
+    cp /tmp/squid-5.9/src/mime.conf.default /usr/share/squid/mime.conf
+    chown proxy:proxy /usr/share/squid/mime.conf
+    chmod 644 /usr/share/squid/mime.conf
+else
+    log "ERROR" "Fichier mime.conf.default non trouvé"
+    exit 1
+fi
+
 # Création et configuration du répertoire PID
 log "INFO" "Configuration du répertoire PID..."
 mkdir -p /var/run/squid
@@ -315,8 +437,8 @@ for dir in "${directories[@]}"; do
     if [ ! -d "$dir" ]; then
         install -d -m 755 "$dir"
     fi
-    chown -R proxy:proxy "$dir"
-    chmod -R 755 "$dir"
+    chown proxy:proxy "$dir"
+    chmod 755 "$dir"
 done
 
 # Synchronisation pour s'assurer que les modifications sont appliquées
@@ -431,7 +553,7 @@ check_error $? "Signature certificat serveur"
 cat squid.key squid.crt squid-ca-cert.pem > squid.pem
 check_error $? "Création fichier PEM"
 
-# Configuration des permissions
+# Configuration des permissions SSL
 chmod 400 squid*.pem squid.key
 chown proxy:proxy squid*.pem squid.key
 
@@ -446,14 +568,32 @@ if ! initialize_ssl_db; then
     exit 1
 fi
 
-# 4. Configuration de Squid
+# 4. Configuration de Squid avec nouvelle configuration des ports
 cat > /etc/squid/squid.conf <<EOL
 # Ports d'écoute
-http_port 0.0.0.0:3128 intercept
-https_port 0.0.0.0:3129 intercept ssl-bump generate-host-certificates=on dynamic_cert_mem_cache_size=4MB cert=/etc/squid/ssl/squid.pem key=/etc/squid/ssl/squid.key cipher=HIGH:MEDIUM:!LOW:!RC4:!SEED:!IDEA:!3DES:!MD5:!EXP:!PSK:!DSS options=NO_TLSv1,NO_SSLv3
+http_port 8080
+http_port 0.0.0.0:3128 transparent
+
+# Configuration HTTPS allégée
+https_port 3129 tls-cert=/etc/squid/ssl/squid.pem \
+    cipher=HIGH:MEDIUM:!LOW:!RC4:!SEED:!IDEA:!3DES:!MD5:!EXP:!PSK:!DSS \
+    options=NO_SSLv3 \
+    generate-host-certificates=on \
+    dynamic_cert_mem_cache_size=2MB
+
+# Configuration SSL allégée
+sslcrtd_program /usr/lib/squid/security_file_certgen -s /var/lib/squid/ssl_db -M 2MB
+sslcrtd_children 3 startup=1
+sslproxy_cert_error allow all
+tls_outgoing_options flags=DONT_VERIFY_PEER
 
 # Options globales
 visible_hostname ${VM_NAME}
+
+# Configuration des icônes et erreurs
+error_directory /usr/share/squid/errors/en
+icon_directory /usr/share/squid/icons
+mime_table /usr/share/squid/mime.conf
 
 # ACLs de base
 acl localnet src all
@@ -480,8 +620,6 @@ sslproxy_cert_error allow all
 tls_outgoing_options flags=DONT_VERIFY_PEER
 
 # Règles d'accès
-http_access allow localhost manager
-http_access deny manager
 http_access allow localnet
 http_access allow localhost
 http_access deny all
@@ -489,6 +627,8 @@ http_access deny all
 # Configuration du cache
 cache_dir ufs /var/spool/squid 100 16 256
 coredump_dir /var/spool/squid
+cache_effective_user proxy
+cache_effective_group proxy
 maximum_object_size 4096 MB
 
 # Configuration IPv4
@@ -501,9 +641,6 @@ ipcache_size 4096
 ipcache_low 90
 ipcache_high 95
 
-# Configuration TLS
-tls_outgoing_options cipher=HIGH:MEDIUM:!LOW:!RC4:!SEED:!IDEA:!3DES:!MD5:!EXP:!PSK:!DSS options=NO_TLSv1,NO_SSLv3
-
 # Configuration avancée
 always_direct allow all
 ssl_unclean_shutdown on
@@ -515,29 +652,15 @@ refresh_pattern -i (/cgi-bin/|\?) 0     0%      0
 refresh_pattern .               0       20%     4320
 
 # Configuration des logs
-logformat combined %>a %[ui %[un [%tl] "%rm %ru HTTP/%rv" %Hs %<st "%{Referer}>h" "%{User-Agent}>h" %Ss:%Sh
 access_log daemon:/var/log/squid/access.log combined
 cache_log /var/log/squid/cache.log
 cache_store_log none
 
-# Debug settings
-debug_options ALL,1 33,2 28,9
+# Debug settings pour le démarrage initial
+debug_options ALL,1
 EOL
 
-# Vérification de la configuration
-log "INFO" "Vérification de la configuration Squid..."
-if ! /usr/sbin/squid -k parse; then
-    log "ERROR" "Configuration Squid invalide"
-    squid -k parse
-    exit 1
-fi
-
-log "INFO" "Installation des icônes Squid..."
-mkdir -p /usr/share/squid/icons
-cp -r /tmp/squid-5.9/icons/* /usr/share/squid/icons/
-chown -R proxy:proxy /usr/share/squid/icons
-
-# Configuration du service systemd
+# Configuration du service systemd avec amélioration des capacités
 cat > /etc/systemd/system/squid.service <<EOL
 [Unit]
 Description=Squid proxy server
@@ -546,12 +669,20 @@ After=network.target
 [Service]
 Type=forking
 PIDFile=/var/run/squid/squid.pid
-User=proxy
+User=root
+Group=proxy
 RuntimeDirectory=squid
 RuntimeDirectoryMode=0755
-ExecStartPre=/usr/sbin/squid -N -z
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_SETGID CAP_SETUID CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_SETGID CAP_SETUID CAP_NET_ADMIN
+SecureBits=keep-caps
+NoNewPrivileges=no
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ExecStartPre=/bin/rm -f /var/run/squid/squid.pid
 ExecStartPre=/usr/sbin/squid -k parse
-ExecStart=/usr/sbin/squid -YD -f /etc/squid/squid.conf
+ExecStart=/usr/sbin/squid -YC -f /etc/squid/squid.conf
 ExecReload=/usr/sbin/squid -k reconfigure
 ExecStop=/usr/sbin/squid -k shutdown
 Restart=always
@@ -564,41 +695,128 @@ Environment=SQUID_CONF=/etc/squid/squid.conf
 WantedBy=multi-user.target
 EOL
 
-log "INFO" "Préparation du démarrage de Squid..."
+# Nettoyage des anciens caches et logs
+log "INFO" "Nettoyage des anciens fichiers..."
+systemctl stop squid || true
+rm -rf /var/cache/squid/*
+rm -rf /var/log/squid/*
+rm -rf /var/spool/squid/*
 
+# Configuration des permissions finales
+log "INFO" "Configuration des permissions finales..."
 directories=(
-    "/var/run/squid"
+    "/etc/squid"
     "/var/log/squid"
-    "/var/cache/squid"
     "/var/spool/squid"
+    "/var/cache/squid"
+    "/var/run/squid"
+    "/usr/lib/squid"
+    "/var/lib/squid"
+    "/var/lib/squid/ssl_db"
 )
 
 for dir in "${directories[@]}"; do
-    mkdir -p "$dir"
-    chown -R proxy:proxy "$dir"
+    if [ ! -d "$dir" ]; then
+        install -d -m 755 "$dir"
+    fi
+    chown proxy:proxy "$dir"
     chmod 755 "$dir"
 done
 
+# Permissions spéciales pour le répertoire de cache
+log "INFO" "Configuration des permissions du cache..."
+install -d -m 755 /var/spool/squid
+chown proxy:proxy /var/spool/squid
+chmod 755 /var/spool/squid
 
-# Initialisation du cache
+# Nettoyage complet avant initialisation du cache
+log "INFO" "Vérification des instances existantes..."
+if ! stop_existing_squid; then
+    log "ERROR" "Échec de l'arrêt de l'instance existante"
+    exit 1
+fi
+
+# Vérification finale des certificats SSL
+log "INFO" "Vérification finale des certificats SSL..."
+ssl_files=(
+    "/etc/squid/ssl/squid.pem"
+    "/etc/squid/ssl/squid.key"
+    "/etc/squid/ssl/squid-ca-cert.pem"
+)
+
+for file in "${ssl_files[@]}"; do
+    if [ ! -f "$file" ]; then
+        log "ERROR" "Certificat manquant: $file"
+        exit 1
+    fi
+    
+    # Vérification des permissions
+    chmod 400 "$file"
+    chown proxy:proxy "$file"
+    
+    # Vérification de la validité du certificat
+    if [[ "$file" == *.pem ]] || [[ "$file" == *.crt ]]; then
+        openssl x509 -in "$file" -noout -text >/dev/null 2>&1 || {
+            log "ERROR" "Certificat invalide: $file"
+            exit 1
+        }
+    fi
+done
+
+# Vérification des ports avant initialisation
+if ! check_ports; then
+    log "ERROR" "Les ports sont toujours utilisés après le nettoyage"
+    exit 1
+fi
+
+# Initialisation du cache squid
 log "INFO" "Initialisation du cache Squid..."
-if ! su -s /bin/bash proxy -c "/usr/sbin/squid -z"; then
-    log "ERROR" "Échec initialisation cache"
+if ! sudo -u proxy /usr/sbin/squid -z -f /etc/squid/squid.conf; then
+    log "ERROR" "Échec de l'initialisation du cache"
+    
+    # Collecte d'informations supplémentaires pour le diagnostic
+    log "INFO" "État des processus Squid :"
+    ps aux | grep squid || true
+    
+    log "INFO" "Contenu du répertoire PID :"
+    ls -la /var/run/squid/ || true
+    
+    log "INFO" "Fichiers PID existants :"
+    find /var/run -name "*squid*" -ls || true
+    
     exit 1
 fi
 
-log "INFO" "Vérification de la configuration..."
-if ! su -s /bin/bash proxy -c "/usr/sbin/squid -k parse"; then
-    log "ERROR" "Configuration invalide"
+# Vérification post-initialisation
+if [ -f "/var/run/squid/squid.pid" ]; then
+    log "WARNING" "Fichier PID trouvé après initialisation, nettoyage..."
+    rm -f /var/run/squid/squid.pid
+fi
+
+# Configuration des capacités système
+log "INFO" "Configuration des capacités système..."
+setcap 'cap_net_bind_service=+ep' /usr/sbin/squid
+setcap 'cap_dac_override=+ep' /usr/sbin/squid
+
+# Démarrer Squid en mode debug d'abord
+log "INFO" "Test de démarrage en mode debug..."
+if ! sudo -u proxy /usr/sbin/squid -N -d1 -X -f /etc/squid/squid.conf; then
+    log "ERROR" "Échec du démarrage en mode debug"
     exit 1
 fi
 
-# Rechargement systemd et redémarrage du service
+# Si le démarrage en debug réussit, arrêter et démarrer en mode service
+if [ -f "/var/run/squid/squid.pid" ]; then
+    kill $(cat /var/run/squid/squid.pid)
+    sleep 5
+fi
+
+# Rechargement de systemd
+log "INFO" "Rechargement de la configuration systemd..."
 systemctl daemon-reload
-systemctl stop squid || true
 
-# Démarrage avec vérifications
-log "INFO" "Démarrage de Squid avec debug..."
+# Démarrage du service
+log "INFO" "Démarrage du service Squid..."
 if ! systemctl start squid; then
     log "ERROR" "Échec du démarrage de Squid"
     log "ERROR" "Contenu de cache.log:"
@@ -610,80 +828,43 @@ if ! systemctl start squid; then
     exit 1
 fi
 
-# Pause pour laisser le temps au service de démarrer
+# Pause pour le démarrage
 sleep 5
 
-# Vérification détaillée du statut
-log "INFO" "Vérification du statut après démarrage..."
+# Vérification finale
+log "INFO" "Vérification finale..."
 if ! systemctl is-active --quiet squid; then
     log "ERROR" "Squid n'est pas actif"
-    log "ERROR" "Contenu de cache.log:"
-    cat /var/log/squid/cache.log || true
-    log "ERROR" "Vérification des processus:"
-    ps aux | grep squid
+    systemctl status squid -l
     exit 1
 fi
 
-# Vérification des ports avec plus de détails
+# Vérification des processus Squid
+if ! pgrep -f 'squid: worker' > /dev/null; then
+    log "ERROR" "Aucun processus worker Squid trouvé"
+    exit 1
+fi
+
+# Vérification des ports
 log "INFO" "Vérification des ports..."
-netstat -tulpn | grep squid || true
-
-# Attente supplémentaire pour l'ouverture des ports
-sleep 5
-
-# Vérification spécifique pour IPv4
-if ! netstat -tulpn | grep -q "0.0.0.0:3128"; then
-    log "ERROR" "Port 3128 non ouvert sur IPv4"
-    log "INFO" "Liste des ports ouverts:"
-    netstat -tulpn
-    log "INFO" "Status du pare-feu:"
-    iptables -L -n -v
-    exit 1
-fi
-
-if ! netstat -tulpn | grep -q "0.0.0.0:3129"; then
-    log "ERROR" "Port 3129 non ouvert sur IPv4"
-    log "INFO" "Liste des ports ouverts:"
-    netstat -tulpn
-    exit 1
-fi
-
-# Vérification finale des permissions
-log "INFO" "Vérification finale des permissions..."
-for dir in "${directories[@]}"; do
-    if [ ! -d "$dir" ]; then
-        log "ERROR" "Répertoire manquant après installation: $dir"
-        exit 1
-    fi
-    
-    current_owner=$(stat -c '%U:%G' "$dir")
-    current_perms=$(stat -c '%a' "$dir")
-    
-    if [ "$current_owner" != "proxy:proxy" ]; then
-        log "ERROR" "Permissions incorrectes sur $dir (propriétaire: $current_owner)"
-        exit 1
-    fi
-    
-    if [ "$current_perms" != "755" ]; then
-        log "ERROR" "Permissions incorrectes sur $dir (permissions: $current_perms)"
+for port in 3128 3129 8080; do
+    if ! netstat -tuln | grep -q ":$port "; then
+        log "ERROR" "Port $port non en écoute"
         exit 1
     fi
 done
 
-# Message de succès avec plus d'informations
-log "INFO" "Installation Squid terminée avec succès"
-log "INFO" "Version installée: $(/usr/sbin/squid -v | head -n1)"
-log "INFO" "Ports ouverts:"
-netstat -tulpn | grep squid
+log "INFO" "Installation terminée avec succès"
+log "INFO" "Version Squid: $(/usr/sbin/squid -v | head -n1)"
 
 # Affichage des informations de configuration
-log "INFO" "Configuration réseau:"
+log "INFO" "Configuration réseau :"
 ip addr show
 
-log "INFO" "Routes configurées:"
+log "INFO" "Routes configurées :"
 ip route show
 
-log "INFO" "Configuration DNS:"
+log "INFO" "Configuration DNS :"
 cat /etc/resolv.conf
 
 exit 0
