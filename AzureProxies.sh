@@ -153,60 +153,16 @@ check_ports() {
     return 0
 }
 
-# Fonction pour vérifier et arrêter une instance existante
-stop_existing_squid() {
-    local pid_file="/var/run/squid/squid.pid"
-    local max_attempts=3
-    local attempt=1
-
-    while [ $attempt -le $max_attempts ]; do
-        log "INFO" "Tentative $attempt d'arrêt de Squid..."
-        
-        # Vérifier si le fichier PID existe
-        if [ -f "$pid_file" ]; then
-            local pid=$(cat "$pid_file")
-            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-                log "INFO" "Instance Squid trouvée avec PID $pid"
-                
-                # Tentative d'arrêt gracieux
-                kill -TERM "$pid"
-                sleep 5
-                
-                # Vérifier si le processus est toujours en vie
-                if kill -0 "$pid" 2>/dev/null; then
-                    log "WARNING" "Force kill du processus Squid (PID: $pid)..."
-                    kill -9 "$pid"
-                    sleep 2
-                fi
-            fi
-            
-            # Supprimer le fichier PID
-            rm -f "$pid_file"
+# Fonction pour vérifier l'état des ports
+check_ports() {
+    local ports=(3128 3129 8080)
+    for port in "${ports[@]}"; do
+        if netstat -tuln | grep -q ":$port "; then
+            log "WARNING" "Port $port déjà en utilisation"
+            return 1
         fi
-        
-        # Nettoyer les sockets en TIME_WAIT
-        ss -K dst :3128 || true
-        ss -K dst :3129 || true
-        ss -K dst :8080 || true
-
-        # Vérifier et tuer tous les processus liés à squid
-        pkill -9 -f squid || true
-        
-        # Attendre la libération complète des ports
-        timeout 30 bash -c 'until ! netstat -tuln | grep -q ":3128\|:3129\|:8080"; do sleep 1; done' || true
-        
-        # Vérification finale
-        if ! pgrep squid >/dev/null && [ ! -f "$pid_file" ] && ! netstat -tuln | grep -q ":3128\|:3129\|:8080"; then
-            log "INFO" "Nettoyage réussi"
-            return 0
-        fi
-        
-        attempt=$((attempt + 1))
-        sleep 3
     done
-    
-    log "ERROR" "Impossible d'arrêter l'instance Squid existante après $max_attempts tentatives"
-    return 1
+    return 0
 }
 
 # Configuration TPROXY
@@ -669,14 +625,15 @@ After=network.target
 [Service]
 Type=forking
 PIDFile=/var/run/squid/squid.pid
-User=root
+User=proxy
 Group=proxy
 RuntimeDirectory=squid
-RuntimeDirectoryMode=0755
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_SETGID CAP_SETUID CAP_NET_ADMIN
-AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_SETGID CAP_SETUID CAP_NET_ADMIN
-SecureBits=keep-caps
-NoNewPrivileges=no
+RuntimeDirectoryMode=0770
+LimitNOFILE=65535
+Restart=always
+RestartSec=5s
+StartLimitInterval=60s
+StartLimitBurst=3
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=true
@@ -728,13 +685,6 @@ log "INFO" "Configuration des permissions du cache..."
 install -d -m 755 /var/spool/squid
 chown proxy:proxy /var/spool/squid
 chmod 755 /var/spool/squid
-
-# Nettoyage complet avant initialisation du cache
-log "INFO" "Vérification des instances existantes..."
-if ! stop_existing_squid; then
-    log "ERROR" "Échec de l'arrêt de l'instance existante"
-    exit 1
-fi
 
 # Vérification finale des certificats SSL
 log "INFO" "Vérification finale des certificats SSL..."
@@ -798,17 +748,35 @@ log "INFO" "Configuration des capacités système..."
 setcap 'cap_net_bind_service=+ep' /usr/sbin/squid
 setcap 'cap_dac_override=+ep' /usr/sbin/squid
 
-# Démarrer Squid en mode debug d'abord
-log "INFO" "Test de démarrage en mode debug..."
-if ! sudo -u proxy /usr/sbin/squid -N -d1 -X -f /etc/squid/squid.conf; then
-    log "ERROR" "Échec du démarrage en mode debug"
+# Test de la configuration
+log "INFO" "Test de la configuration Squid..."
+if ! /usr/sbin/squid -k parse -f /etc/squid/squid.conf; then
+    log "ERROR" "La configuration de Squid est invalide"
     exit 1
 fi
 
-# Si le démarrage en debug réussit, arrêter et démarrer en mode service
-if [ -f "/var/run/squid/squid.pid" ]; then
-    kill $(cat /var/run/squid/squid.pid)
-    sleep 5
+# Configuration des capacités et permissions
+log "INFO" "Configuration des capacités système..."
+setcap cap_net_bind_service,cap_setgid,cap_setuid,cap_net_admin+ep /usr/sbin/squid
+
+# Vérification des permissions critiques
+chown root:proxy /usr/sbin/squid
+chmod 4750 /usr/sbin/squid  # Ajout du bit SUID
+
+# Démarrage initial vérifié
+log "INFO" "Démarrage initial de Squid..."
+if ! /usr/sbin/squid -N -f /etc/squid/squid.conf; then
+    log "ERROR" "Échec du démarrage initial"
+    exit 1
+fi
+
+# Attente courte pour la stabilisation
+sleep 5
+
+# Vérification du démarrage
+if ! pgrep -f "squid: worker" > /dev/null; then
+    log "ERROR" "Processus worker non détecté"
+    exit 1
 fi
 
 # Rechargement de systemd
