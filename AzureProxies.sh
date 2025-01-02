@@ -467,7 +467,16 @@ CN = ${VM_NAME}
 [ v3_req ]
 basicConstraints = CA:FALSE
 keyUsage = digitalSignature, keyEncipherment
-extendedKeyUsage = serverAuth
+extendedKeyUsage = serverAuth, clientAuth
+subjectKeyIdentifier = hash
+subjectAltName = @alt_names
+
+[ v3_signed ]
+basicConstraints = CA:FALSE
+keyUsage = digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth, clientAuth
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid,issuer
 subjectAltName = @alt_names
 
 [ alt_names ]
@@ -502,21 +511,22 @@ openssl x509 -req -days 3650 \
     -CAcreateserial \
     -out squid.crt \
     -extfile server.cnf \
-    -extensions v3_req
+    -extensions v3_signed
 check_error $? "Signature certificat serveur"
 
 # Création du fichier PEM et chaîne complète
-cat squid.key squid.crt squid-ca-cert.pem > squid.pem
+cat squid.key squid.crt > squid.pem
 check_error $? "Création fichier PEM"
 
 # Configuration des permissions SSL
 chmod 400 squid*.pem squid.key
 chown proxy:proxy squid*.pem squid.key
 
-# Vérification des certificats
-log "INFO" "Vérification des certificats..."
+# Après la génération des certificats
+log "INFO" "Vérification de la chaîne de certificats..."
 openssl verify -CAfile squid-ca-cert.pem squid.crt
-check_error $? "Vérification chaîne de certificats"
+openssl x509 -in squid.crt -text -noout | grep "X509v3 Subject Alternative Name" -A1
+openssl x509 -in squid-ca-cert.pem -text -noout | grep "X509v3 Basic Constraints" -A1
 
 # 3. Initialisation de la base SSL
 if ! initialize_ssl_db; then
@@ -530,18 +540,12 @@ cat > /etc/squid/squid.conf <<EOL
 http_port 8080
 http_port 0.0.0.0:3128 transparent
 
-# Configuration HTTPS allégée
+# Configuration HTTPS 
 https_port 3129 tls-cert=/etc/squid/ssl/squid.pem \
     cipher=HIGH:MEDIUM:!LOW:!RC4:!SEED:!IDEA:!3DES:!MD5:!EXP:!PSK:!DSS \
     options=NO_SSLv3 \
     generate-host-certificates=on \
     dynamic_cert_mem_cache_size=2MB
-
-# Configuration SSL allégée
-sslcrtd_program /usr/lib/squid/security_file_certgen -s /var/lib/squid/ssl_db -M 2MB
-sslcrtd_children 3 startup=1
-sslproxy_cert_error allow all
-tls_outgoing_options flags=DONT_VERIFY_PEER
 
 # Options globales
 visible_hostname ${VM_NAME}
@@ -573,7 +577,7 @@ ssl_bump bump all
 sslcrtd_program /usr/lib/squid/security_file_certgen -s /var/lib/squid/ssl_db -M 4MB
 sslcrtd_children 5 startup=1
 sslproxy_cert_error allow all
-tls_outgoing_options flags=DONT_VERIFY_PEER
+tls_outgoing_options cafile=/etc/squid/ssl/squid-ca-cert.pem clientca=/etc/squid/ssl/squid-ca-cert.pem
 
 # Règles d'accès
 http_access allow localnet
@@ -763,10 +767,17 @@ setcap cap_net_bind_service,cap_setgid,cap_setuid,cap_net_admin+ep /usr/sbin/squ
 chown root:proxy /usr/sbin/squid
 chmod 4750 /usr/sbin/squid  # Ajout du bit SUID
 
-# Démarrage initial vérifié
+log "INFO" "Préparation du démarrage initial..."
+if [ ! -d "/var/run/squid" ]; then
+    install -d -m 755 /var/run/squid
+    chown proxy:proxy /var/run/squid
+fi
+
 log "INFO" "Démarrage initial de Squid..."
-if ! /usr/sbin/squid -N -f /etc/squid/squid.conf; then
+if ! sudo -u proxy /usr/sbin/squid -N -f /etc/squid/squid.conf; then
     log "ERROR" "Échec du démarrage initial"
+    log "ERROR" "Vérification des journaux..."
+    cat /var/log/squid/cache.log || true
     exit 1
 fi
 
@@ -823,8 +834,14 @@ for port in 3128 3129 8080; do
 done
 
 log "INFO" "Installation terminée avec succès"
-log "INFO" "Version Squid: $(/usr/sbin/squid -v | head -n1)"
 
+SQUID_VERSION=$(/usr/sbin/squid -v | grep Version | awk '{print $4}')
+log "INFO" "Version de Squid détectée: $SQUID_VERSION"
+
+# Vérification de la compatibilité
+if [[ "$SQUID_VERSION" < "5.0" ]]; then
+    log "WARNING" "Cette configuration est optimisée pour Squid 5.x+"
+fi
 # Affichage des informations de configuration
 log "INFO" "Configuration réseau :"
 ip addr show
