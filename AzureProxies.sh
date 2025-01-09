@@ -88,6 +88,42 @@ check_memory() {
     fi
 }
 
+check_critical_files() {
+    log "INFO" "Vérification des fichiers et permissions critiques..."
+    
+    # Vérification des répertoires
+    for dir in /var/run/squid /var/log/squid /etc/squid/ssl; do
+        if [ ! -d "$dir" ]; then
+            log "ERROR" "Répertoire manquant: $dir"
+            return 1
+        fi
+        perms=$(stat -c %a "$dir")
+        owner=$(stat -c %U "$dir")
+        if [ "$owner" != "proxy" ] || [ "$perms" != "755" ]; then
+            log "ERROR" "Permissions incorrectes pour $dir: owner=$owner, perms=$perms"
+            chmod 755 "$dir"
+            chown proxy:proxy "$dir"
+        fi
+    done
+
+    # Vérification des fichiers SSL
+    for file in /etc/squid/ssl/squid.pem /etc/squid/ssl/squid-ca-cert.pem; do
+        if [ ! -f "$file" ]; then
+            log "ERROR" "Fichier SSL manquant: $file"
+            return 1
+        fi
+        perms=$(stat -c %a "$file")
+        owner=$(stat -c %U "$file")
+        if [ "$owner" != "proxy" ] || [ "$perms" != "640" ]; then
+            log "ERROR" "Permissions incorrectes pour $file: owner=$owner, perms=$perms"
+            chmod 640 "$file"
+            chown proxy:proxy "$file"
+        fi
+    done
+
+    return 0
+}
+
 # Fonction de nettoyage
 cleanup() {
     exec 1>&3
@@ -153,17 +189,6 @@ check_ports() {
     return 0
 }
 
-# Fonction pour vérifier l'état des ports
-check_ports() {
-    local ports=(3128 3129 8080)
-    for port in "${ports[@]}"; do
-        if netstat -tuln | grep -q ":$port "; then
-            log "WARNING" "Port $port déjà en utilisation"
-            return 1
-        fi
-    done
-    return 0
-}
 
 # Configuration TPROXY
 setup_tproxy() {
@@ -514,25 +539,36 @@ openssl x509 -req -days 3650 \
     -extensions v3_signed
 check_error $? "Signature certificat serveur"
 
-# Création du fichier PEM et chaîne complète
-cat squid.key squid.crt > squid.pem
-check_error $? "Création fichier PEM"
+# Regénération du fichier PEM avec la chaîne complète
+cat > chain.pem <<EOL
+$(cat squid.crt)
+$(cat squid-ca-cert.pem)
+EOL
 
-# Configuration des permissions SSL
-chmod 400 squid*.pem squid.key
-chown proxy:proxy squid*.pem squid.key
+cat > squid.pem <<EOL
+$(cat squid.key)
+$(cat chain.pem)
+EOL
 
-# Après la génération des certificats
+chmod 640 chain.pem squid.pem
+chown proxy:proxy chain.pem squid.pem
+
 log "INFO" "Vérification de la chaîne de certificats..."
-openssl verify -CAfile squid-ca-cert.pem squid.crt
-openssl x509 -in squid.crt -text -noout | grep "X509v3 Subject Alternative Name" -A1
-openssl x509 -in squid-ca-cert.pem -text -noout | grep "X509v3 Basic Constraints" -A1
+if ! openssl verify -CAfile /etc/squid/ssl/squid-ca-cert.pem /etc/squid/ssl/squid.crt; then
+    log "ERROR" "La chaîne de certificats est invalide"
+    exit 1
+fi
 
 # 3. Initialisation de la base SSL
 if ! initialize_ssl_db; then
     log "ERROR" "Échec initialisation SSL"
     exit 1
 fi
+
+# 3.5. Création de la liste d'exclusion SSL
+cat > /etc/squid/no-proxy.txt <<EOL
+x/.com
+EOL
 
 # 4. Configuration de Squid avec nouvelle configuration des ports
 cat > /etc/squid/squid.conf <<EOL
@@ -541,7 +577,7 @@ http_port 8080
 http_port 0.0.0.0:3128 transparent
 
 # Configuration HTTPS 
-https_port 3129 tls-cert=/etc/squid/ssl/squid.pem \
+https_port 0.0.0.0:3129 tls-cert=/etc/squid/ssl/squid.pem \
     cipher=HIGH:MEDIUM:!LOW:!RC4:!SEED:!IDEA:!3DES:!MD5:!EXP:!PSK:!DSS \
     options=NO_SSLv3 \
     generate-host-certificates=on \
@@ -564,20 +600,18 @@ acl Safe_ports port 443
 acl Safe_ports port 1025-65535
 acl CONNECT method CONNECT
 
-# SSL Bump rules
-acl step1 at_step SslBump1
-acl step2 at_step SslBump2
-acl step3 at_step SslBump3
-ssl_bump peek step1 all
-ssl_bump peek step2 all
-ssl_bump splice step3 all
+# SSL-Bump & exception list
+acl DiscoverSNIHost at_step SslBump1
+acl NoSSLIntercept ssl::server_name_regex "/etc/squid/no-proxy.txt"
+ssl_bump peek DiscoverSNIHost
+ssl_bump splice NoSSLIntercept
 ssl_bump bump all
 
 # Configuration SSL
 sslcrtd_program /usr/lib/squid/security_file_certgen -s /var/lib/squid/ssl_db -M 4MB
 sslcrtd_children 5 startup=1
 sslproxy_cert_error allow all
-tls_outgoing_options cafile=/etc/squid/ssl/squid-ca-cert.pem clientca=/etc/squid/ssl/squid-ca-cert.pem
+tls_outgoing_options cafile=/etc/squid/ssl/squid-ca-cert.pem
 
 # Règles d'accès
 http_access allow localnet
@@ -632,25 +666,18 @@ PIDFile=/var/run/squid/squid.pid
 User=proxy
 Group=proxy
 RuntimeDirectory=squid
-RuntimeDirectoryMode=0770
+RuntimeDirectoryMode=0755
 LimitNOFILE=65535
-Restart=always
+Restart=on-failure
 RestartSec=5s
 StartLimitInterval=60s
 StartLimitBurst=3
-PrivateTmp=true
-ProtectSystem=full
-ProtectHome=true
 ExecStartPre=/bin/rm -f /var/run/squid/squid.pid
-ExecStartPre=/usr/sbin/squid -k parse
-ExecStart=/usr/sbin/squid -YC -f /etc/squid/squid.conf
-ExecReload=/usr/sbin/squid -k reconfigure
-ExecStop=/usr/sbin/squid -k shutdown
-Restart=always
-RestartSec=5s
+ExecStartPre=/usr/sbin/squid -f /etc/squid/squid.conf -k parse
+ExecStart=/usr/sbin/squid -f /etc/squid/squid.conf
+ExecReload=/usr/sbin/squid -f /etc/squid/squid.conf -k reconfigure
+ExecStop=/usr/sbin/squid -f /etc/squid/squid.conf -k shutdown
 TimeoutStartSec=300
-LimitNOFILE=65535
-Environment=SQUID_CONF=/etc/squid/squid.conf
 
 [Install]
 WantedBy=multi-user.target
@@ -662,6 +689,26 @@ systemctl stop squid || true
 rm -rf /var/cache/squid/*
 rm -rf /var/log/squid/*
 rm -rf /var/spool/squid/*
+
+# Vérification des permissions SSL
+log "INFO" "Vérification finale des permissions SSL..."
+for dir in /etc/squid/ssl /var/lib/squid/ssl_db; do
+    chmod 750 "$dir"
+    chown -R proxy:proxy "$dir"
+done
+
+chmod 640 /etc/squid/ssl/squid.pem
+chmod 640 /etc/squid/ssl/squid-ca-cert.pem
+chmod 640 /etc/squid/ssl/squid.key
+chown -R proxy:proxy /etc/squid/ssl/*
+
+# Vérification des permissions des répertoires critiques
+for dir in /var/log/squid /var/cache/squid /var/run/squid; do
+    chmod 750 "$dir"
+    chown -R proxy:proxy "$dir"
+done
+
+
 
 # Configuration des permissions finales
 log "INFO" "Configuration des permissions finales..."
@@ -741,11 +788,6 @@ if ! sudo -u proxy /usr/sbin/squid -z -f /etc/squid/squid.conf; then
     exit 1
 fi
 
-# Vérification post-initialisation
-if [ -f "/var/run/squid/squid.pid" ]; then
-    log "WARNING" "Fichier PID trouvé après initialisation, nettoyage..."
-    rm -f /var/run/squid/squid.pid
-fi
 
 # Configuration des capacités système
 log "INFO" "Configuration des capacités système..."
@@ -773,11 +815,19 @@ if [ ! -d "/var/run/squid" ]; then
     chown proxy:proxy /var/run/squid
 fi
 
+log "INFO" "Vérification des fichiers critiques..."
+if ! check_critical_files; then
+    log "ERROR" "Échec de la vérification des fichiers critiques"
+    exit 1
+fi
+
 log "INFO" "Démarrage initial de Squid..."
-if ! sudo -u proxy /usr/sbin/squid -N -f /etc/squid/squid.conf; then
+if ! sudo -u proxy /usr/sbin/squid -N -d 1 -f /etc/squid/squid.conf 2>&1 | tee -a /var/log/squid/startup.log; then
     log "ERROR" "Échec du démarrage initial"
-    log "ERROR" "Vérification des journaux..."
-    cat /var/log/squid/cache.log || true
+    log "ERROR" "Contenu des logs de démarrage:"
+    tail -n 50 /var/log/squid/startup.log
+    log "ERROR" "Contenu du cache.log:"
+    tail -n 50 /var/log/squid/cache.log || true
     exit 1
 fi
 
@@ -790,16 +840,15 @@ if ! pgrep -f "squid: worker" > /dev/null; then
     exit 1
 fi
 
-# Rechargement de systemd
-log "INFO" "Rechargement de la configuration systemd..."
-systemctl daemon-reload
-
-# Démarrage du service
 log "INFO" "Démarrage du service Squid..."
+systemctl daemon-reload
+sleep 2
+systemctl enable squid
+sleep 2
 if ! systemctl start squid; then
     log "ERROR" "Échec du démarrage de Squid"
     log "ERROR" "Contenu de cache.log:"
-    cat /var/log/squid/cache.log || true
+    tail -n 50 /var/log/squid/cache.log || true
     log "ERROR" "Status du service:"
     systemctl status squid -l
     log "ERROR" "Journaux systemd:"
